@@ -9,18 +9,27 @@ from __future__ import annotations
 
 import inspect
 import logging
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from typing import Any, Final, Mapping
 from urllib.parse import urlparse
 
 from binance.spot import Spot
 
+from core.audit import audit
 from core.config import SPOT_BASE_URL, Settings, get_settings
+from core.kill_switch import get_kill_switch
+from core.risk import (
+    MAX_EXPOSURE_FRACTION,
+    MAX_NOTIONAL_USDT,
+    STABLE_ASSETS,
+    enforce_size_limits,
+    parse_positive_decimal,
+    validate_protective_prices,
+)
 from policies.testnet_only import verify_testnet_environment
 
 logger = logging.getLogger(__name__)
 
-MAX_EXPOSURE_FRACTION: Final[Decimal] = Decimal("0.10")
 ALLOWED_SIDES: Final[frozenset[str]] = frozenset({"BUY", "SELL"})
 QUOTE_ASSETS: Final[tuple[str, ...]] = (
     "USDT",
@@ -34,24 +43,31 @@ QUOTE_ASSETS: Final[tuple[str, ...]] = (
     "EUR",
     "TRY",
 )
-STABLE_ASSETS: Final[frozenset[str]] = frozenset({"USDT", "USDC", "FDUSD", "BUSD", "TUSD"})
+_FILTER_CACHE: dict[str, dict[str, Decimal]] = {}
 
 
 def create_spot_testnet_client() -> Spot:
     """Build a ``binance-connector`` Spot client pinned to Testnet credentials."""
+    get_kill_switch().raise_if_tripped()
     settings = get_settings()
     _assert_testnet_settings(settings)
     api_key = settings.spot_api_key.get_secret_value()
     api_secret = settings.spot_api_secret.get_secret_value()
     client = Spot(**_spot_constructor_kwargs(api_key, api_secret, settings.spot_base_url))
     _assert_testnet_client(client, settings)
+    audit("API_CALL", "Created Spot Testnet client.", venue="spot", host=settings.spot_base_url)
     return client
 
 
 def get_spot_testnet_balance(client: Spot) -> dict[str, Any]:
     """Fetch Spot Testnet account balances. Read-only; no order is placed."""
     settings = _guard_spot_client(client)
-    raw = _invoke(client, "account")
+    audit("API_CALL", "GET Spot Testnet account.", venue="spot", method="account")
+    try:
+        raw = _invoke(client, "account")
+    except Exception as exc:
+        audit("API_ERROR", "Spot account fetch failed.", venue="spot", error=str(exc))
+        raise
     account = _as_mapping(raw)
     balances = _nonzero_balances(account.get("balances", []))
     return {
@@ -68,19 +84,98 @@ def get_spot_testnet_balance(client: Spot) -> dict[str, Any]:
     }
 
 
+def get_spot_testnet_ticker(symbol: str, client: Spot | None = None) -> dict[str, Any]:
+    """Fetch last price and 24h ticker from Spot Testnet (read-only)."""
+    own_client = client is None
+    if client is None:
+        client = create_spot_testnet_client()
+    try:
+        settings = _guard_spot_client(client)
+        normalized = _normalize_symbol(symbol)
+        audit("API_CALL", "GET Spot Testnet ticker.", venue="spot", symbol=normalized)
+        try:
+            price_raw = _as_mapping(_invoke(client, "ticker_price", symbol=normalized))
+            stats_raw = _invoke(client, "ticker_24hr", symbol=normalized)
+            stats = _as_mapping(stats_raw) if not isinstance(stats_raw, list) else _as_mapping(stats_raw[0])
+            klines: list[Any] = []
+            try:
+                kline_raw = _invoke(client, "klines", normalized, "1h", limit=12)
+                if isinstance(kline_raw, list):
+                    klines = kline_raw
+            except Exception:
+                klines = []
+        except Exception as exc:
+            audit("API_ERROR", "Spot ticker fetch failed.", venue="spot", symbol=normalized, error=str(exc))
+            raise
+        last_price = Decimal(str(price_raw.get("price") or stats.get("lastPrice") or "0"))
+        hourly_closes = []
+        for row in klines:
+            if isinstance(row, (list, tuple)) and len(row) > 4:
+                hourly_closes.append(str(row[4]))
+        return {
+            "environment": "testnet",
+            "venue": "spot",
+            "base_url": settings.spot_base_url,
+            "symbol": normalized,
+            "last_price": format(last_price, "f") if last_price > 0 else str(price_raw.get("price", "")),
+            "price_change_percent": str(stats.get("priceChangePercent", "")),
+            "open_price": str(stats.get("openPrice", "")),
+            "high_price": str(stats.get("highPrice", "")),
+            "low_price": str(stats.get("lowPrice", "")),
+            "volume": str(stats.get("volume", "")),
+            "quote_volume": str(stats.get("quoteVolume", "")),
+            "weighted_avg_price": str(stats.get("weightedAvgPrice", "")),
+            "bid_price": str(stats.get("bidPrice", "")),
+            "ask_price": str(stats.get("askPrice", "")),
+            "trade_count": stats.get("count"),
+            "hourly_closes": hourly_closes,
+        }
+    finally:
+        if own_client:
+            _close_spot_session(client)
+
+
 def preview_spot_testnet_order(
     symbol: str,
     side: str,
     quantity: Decimal | float | int | str,
+    stop_loss: Decimal | float | int | str | None = None,
+    take_profit: Decimal | float | int | str | None = None,
+    client: Spot | None = None,
 ) -> dict[str, Any]:
-    """Return a structured mock order preview. Does not contact the matching engine."""
+    """Return a structured order preview. Does not contact the matching engine."""
+    get_kill_switch().raise_if_tripped()
     settings = get_settings()
     _assert_testnet_settings(settings)
     normalized_symbol = _normalize_symbol(symbol)
     normalized_side = _normalize_side(side)
     normalized_quantity = _normalize_quantity(quantity)
+    sl = _optional_price(stop_loss, "stop-loss")
+    tp = _optional_price(take_profit, "take-profit")
     quote_asset = _quote_asset(normalized_symbol)
-    return {
+
+    own_client = client is None
+    if client is None:
+        client = create_spot_testnet_client()
+    settings = _guard_spot_client(client)
+    last_price = _last_price(client, normalized_symbol)
+    if sl is not None or tp is not None:
+        validate_protective_prices(
+            side=normalized_side,
+            last_price=last_price,
+            stop_loss=sl,
+            take_profit=tp,
+        )
+    risk = _enforce_exposure_limit(
+        client,
+        symbol=normalized_symbol,
+        side=normalized_side,
+        quantity=normalized_quantity,
+    )
+    if own_client:
+        _close_spot_session(client)
+
+    preview = {
         "environment": "testnet",
         "status": "order_preview",
         "venue": "spot",
@@ -91,11 +186,19 @@ def preview_spot_testnet_order(
             "symbol": normalized_symbol,
             "side": normalized_side,
             "type": "MARKET",
-            "quantity": format(normalized_quantity, "f"),
+            "quantity": _fmt(normalized_quantity),
             "quote_asset": quote_asset,
+            "stop_loss": _fmt(sl) if sl is not None else None,
+            "take_profit": _fmt(tp) if tp is not None else None,
+            "estimated_last_price": _fmt(last_price),
+            "estimated_notional": _fmt(normalized_quantity * last_price),
         },
         "risk": {
-            "max_exposure_fraction": format(MAX_EXPOSURE_FRACTION, "f"),
+            "max_exposure_fraction": _fmt(MAX_EXPOSURE_FRACTION),
+            "max_notional_usdt": _fmt(MAX_NOTIONAL_USDT),
+            "effective_cap_usdt": _fmt(risk["effective_cap_usdt"]),
+            "portfolio_usdt": _fmt(risk["portfolio_usdt"]),
+            "notional_usdt": _fmt(risk["notional_usdt"]),
             "human_confirmation_required": True,
             "policy": "policies/execution_guardrails.md",
         },
@@ -107,6 +210,17 @@ def preview_spot_testnet_order(
             "Preview only. No Testnet order was sent and no production host was contacted."
         ),
     }
+    audit(
+        "TRADE_PREVIEW",
+        "Spot order preview built.",
+        venue="spot",
+        symbol=normalized_symbol,
+        side=normalized_side,
+        quantity=_fmt(normalized_quantity),
+        stop_loss=_fmt(sl) if sl is not None else None,
+        take_profit=_fmt(tp) if tp is not None else None,
+    )
+    return preview
 
 
 def submit_spot_testnet_order(
@@ -115,9 +229,19 @@ def submit_spot_testnet_order(
     side: str,
     quantity: Decimal | float | int | str,
     human_confirmed: bool = False,
+    stop_loss: Decimal | float | int | str | None = None,
+    take_profit: Decimal | float | int | str | None = None,
 ) -> dict[str, Any]:
     """Submit a Spot Testnet MARKET order only after explicit human confirmation."""
+    get_kill_switch().raise_if_tripped()
     if human_confirmed is not True:
+        audit(
+            "TRADE_REJECTED",
+            "Spot submit denied: human_confirmed is not True.",
+            venue="spot",
+            symbol=symbol,
+            side=side,
+        )
         raise PermissionError(
             "submit_spot_testnet_order requires explicit human confirmation. "
             "human_confirmed=False is treated as denial. No order was sent."
@@ -127,7 +251,17 @@ def submit_spot_testnet_order(
     normalized_symbol = _normalize_symbol(symbol)
     normalized_side = _normalize_side(side)
     normalized_quantity = _normalize_quantity(quantity)
+    sl = _optional_price(stop_loss, "stop-loss")
+    tp = _optional_price(take_profit, "take-profit")
 
+    last_price = _last_price(client, normalized_symbol)
+    if sl is not None or tp is not None:
+        validate_protective_prices(
+            side=normalized_side,
+            last_price=last_price,
+            stop_loss=sl,
+            take_profit=tp,
+        )
     _enforce_exposure_limit(
         client,
         symbol=normalized_symbol,
@@ -135,21 +269,78 @@ def submit_spot_testnet_order(
         quantity=normalized_quantity,
     )
 
+    qty_str = _fmt(_quantize_quantity(client, normalized_symbol, normalized_quantity))
     logger.info(
-        "Submitting Spot Testnet MARKET order symbol=%s side=%s quantity=%s",
+        "Submitting Spot Testnet MARKET order symbol=%s side=%s quantity=%s sl=%s tp=%s",
         normalized_symbol,
         normalized_side,
-        format(normalized_quantity, "f"),
+        qty_str,
+        _fmt(sl) if sl is not None else None,
+        _fmt(tp) if tp is not None else None,
     )
-    raw = _invoke(
-        client,
-        "new_order",
+    audit(
+        "API_CALL",
+        "POST Spot Testnet MARKET new_order.",
+        venue="spot",
         symbol=normalized_symbol,
         side=normalized_side,
-        type="MARKET",
-        quantity=format(normalized_quantity, "f"),
+        quantity=qty_str,
     )
+    try:
+        raw = _invoke(
+            client,
+            "new_order",
+            symbol=normalized_symbol,
+            side=normalized_side,
+            type="MARKET",
+            quantity=qty_str,
+        )
+    except Exception as exc:
+        audit(
+            "API_ERROR",
+            "Spot MARKET order failed.",
+            venue="spot",
+            symbol=normalized_symbol,
+            error=str(exc),
+        )
+        raise
     exchange_response = _as_mapping(raw)
+    filled_qty = _filled_quantity(exchange_response, Decimal(qty_str))
+
+    protection: dict[str, Any] | None = None
+    protection_error: str | None = None
+    if sl is not None or tp is not None:
+        try:
+            protection = _place_spot_protection(
+                client,
+                symbol=normalized_symbol,
+                entry_side=normalized_side,
+                quantity=filled_qty,
+                stop_loss=sl,
+                take_profit=tp,
+            )
+        except Exception as exc:
+            protection_error = str(exc)
+            audit(
+                "API_ERROR",
+                "Spot SL/TP protection failed after entry fill.",
+                venue="spot",
+                symbol=normalized_symbol,
+                error=protection_error,
+            )
+
+    audit(
+        "TRADE_CONFIRMED",
+        "Spot Testnet MARKET order submitted.",
+        venue="spot",
+        symbol=normalized_symbol,
+        side=normalized_side,
+        quantity=qty_str,
+        order_id=exchange_response.get("orderId"),
+        stop_loss=_fmt(sl) if sl is not None else None,
+        take_profit=_fmt(tp) if tp is not None else None,
+        protection_ok=protection_error is None,
+    )
     return {
         "environment": "testnet",
         "status": "submitted",
@@ -160,10 +351,170 @@ def submit_spot_testnet_order(
             "symbol": normalized_symbol,
             "side": normalized_side,
             "type": "MARKET",
-            "quantity": format(normalized_quantity, "f"),
+            "quantity": qty_str,
+            "stop_loss": _fmt(sl) if sl is not None else None,
+            "take_profit": _fmt(tp) if tp is not None else None,
         },
         "exchange_response": exchange_response,
+        "protection": protection,
+        "protection_error": protection_error,
     }
+
+
+def _place_spot_protection(
+    client: Spot,
+    *,
+    symbol: str,
+    entry_side: str,
+    quantity: Decimal,
+    stop_loss: Decimal | None,
+    take_profit: Decimal | None,
+) -> dict[str, Any]:
+    """Attach OCO or standalone STOP_LOSS / TAKE_PROFIT after a filled MARKET entry."""
+    protect_side = "SELL" if entry_side == "BUY" else "BUY"
+    qty = _fmt(_quantize_quantity(client, symbol, quantity))
+    sl_price = _quantize_price(client, symbol, stop_loss) if stop_loss is not None else None
+    tp_price = _quantize_price(client, symbol, take_profit) if take_profit is not None else None
+    attempts: list[dict[str, Any]] = []
+
+    if sl_price is not None and tp_price is not None:
+        oco = _try_spot_oco(
+            client,
+            symbol=symbol,
+            side=protect_side,
+            quantity=qty,
+            stop_loss=sl_price,
+            take_profit=tp_price,
+        )
+        if oco is not None and oco.get("response") is not None:
+            return {
+                "mode": oco["mode"],
+                "exchange_response": oco["response"],
+                "attempts": oco.get("attempts", []),
+            }
+        attempts.extend((oco or {}).get("attempts") or [])
+
+    responses: dict[str, Any] = {}
+    if sl_price is not None:
+        responses["stop_loss"] = _place_spot_stop(
+            client, symbol=symbol, side=protect_side, quantity=qty, stop_price=sl_price, kind="STOP_LOSS"
+        )
+    if tp_price is not None:
+        responses["take_profit"] = _place_spot_stop(
+            client, symbol=symbol, side=protect_side, quantity=qty, stop_price=tp_price, kind="TAKE_PROFIT"
+        )
+    return {"mode": "standalone_exits", "exchange_response": responses, "attempts": attempts}
+
+
+def _try_spot_oco(
+    client: Spot,
+    *,
+    symbol: str,
+    side: str,
+    quantity: str,
+    stop_loss: Decimal,
+    take_profit: Decimal,
+) -> dict[str, Any] | None:
+    sl_str = _fmt(stop_loss)
+    tp_str = _fmt(take_profit)
+    sl_limit = _fmt(_quantize_price(client, symbol, _stop_limit_price(side, stop_loss)))
+    attempts: list[str] = []
+
+    list_kwargs = {
+        "symbol": symbol,
+        "side": side,
+        "quantity": quantity,
+        "aboveType": "TAKE_PROFIT",
+        "belowType": "STOP_LOSS",
+        "aboveStopPrice": tp_str if side == "SELL" else sl_str,
+        "belowStopPrice": sl_str if side == "SELL" else tp_str,
+    }
+    if side == "BUY":
+        list_kwargs["aboveType"] = "STOP_LOSS"
+        list_kwargs["belowType"] = "TAKE_PROFIT"
+        list_kwargs["aboveStopPrice"] = sl_str
+        list_kwargs["belowStopPrice"] = tp_str
+
+    for method_name, kwargs in (
+        ("new_order_list_oco", list_kwargs),
+        (
+            "new_oco_order",
+            {
+                "symbol": symbol,
+                "side": side,
+                "quantity": quantity,
+                "price": tp_str,
+                "stopPrice": sl_str,
+                "stopLimitPrice": sl_limit,
+                "stopLimitTimeInForce": "GTC",
+            },
+        ),
+    ):
+        if not _has_method(client, method_name):
+            attempts.append(f"{method_name}:not_available")
+            continue
+        try:
+            audit("API_CALL", f"POST Spot {method_name}.", venue="spot", symbol=symbol, method=method_name)
+            response = _as_mapping(_invoke(client, method_name, **kwargs))
+            return {"mode": method_name, "response": response, "attempts": attempts}
+        except Exception as exc:
+            attempts.append(f"{method_name}:{exc}")
+            continue
+    return {"mode": None, "response": None, "attempts": attempts}
+
+
+def _place_spot_stop(
+    client: Spot,
+    *,
+    symbol: str,
+    side: str,
+    quantity: str,
+    stop_price: Decimal,
+    kind: str,
+) -> dict[str, Any]:
+    stop_str = _fmt(stop_price)
+    limit_price = _fmt(_quantize_price(client, symbol, _stop_limit_price(side, stop_price)))
+    errors: list[str] = []
+    for order_type, extra in (
+        (kind, {"stopPrice": stop_str}),
+        (
+            f"{kind}_LIMIT",
+            {"stopPrice": stop_str, "price": limit_price, "timeInForce": "GTC"},
+        ),
+    ):
+        try:
+            audit(
+                "API_CALL",
+                f"POST Spot {order_type} protection.",
+                venue="spot",
+                symbol=symbol,
+                side=side,
+                type=order_type,
+            )
+            return _as_mapping(
+                _invoke(
+                    client,
+                    "new_order",
+                    symbol=symbol,
+                    side=side,
+                    type=order_type,
+                    quantity=quantity,
+                    **extra,
+                )
+            )
+        except Exception as exc:
+            errors.append(f"{order_type}: {exc}")
+            continue
+    raise RuntimeError(
+        f"Unable to place Spot {kind} protection on Testnet ({'; '.join(errors)})."
+    )
+
+
+def _stop_limit_price(side: str, stop_price: Decimal) -> Decimal:
+    buffer = Decimal("0.0015")
+    if side == "SELL":
+        return stop_price * (Decimal("1") - buffer)
+    return stop_price * (Decimal("1") + buffer)
 
 
 def _spot_constructor_kwargs(api_key: str, api_secret: str, base_url: str) -> dict[str, str]:
@@ -222,13 +573,23 @@ def _assert_testnet_client(client: Spot, settings: Settings) -> None:
 
 
 def _guard_spot_client(client: Spot) -> Settings:
+    get_kill_switch().raise_if_tripped()
     settings = get_settings()
     _assert_testnet_settings(settings)
     _assert_testnet_client(client, settings)
     return settings
 
 
-def _invoke(client: Spot, method_name: str, **kwargs: Any) -> Any:
+def _has_method(client: Spot, method_name: str) -> bool:
+    method = getattr(client, method_name, None)
+    if callable(method):
+        return True
+    rest_api = getattr(client, "rest_api", None)
+    return callable(getattr(rest_api, method_name, None)) if rest_api is not None else False
+
+
+def _invoke(client: Spot, method_name: str, *args: Any, **kwargs: Any) -> Any:
+    get_kill_switch().raise_if_tripped()
     method = getattr(client, method_name, None)
     if not callable(method):
         rest_api = getattr(client, "rest_api", None)
@@ -237,7 +598,7 @@ def _invoke(client: Spot, method_name: str, **kwargs: Any) -> Any:
         raise RuntimeError(
             f"binance-connector Spot client does not expose {method_name}()."
         )
-    response = method(**kwargs) if kwargs else method()
+    response = method(*args, **kwargs) if (args or kwargs) else method()
     if hasattr(response, "data") and callable(response.data):
         return response.data()
     return response
@@ -272,13 +633,17 @@ def _normalize_side(side: str) -> str:
 
 
 def _normalize_quantity(quantity: Decimal | float | int | str) -> Decimal:
-    try:
-        value = Decimal(str(quantity).strip())
-    except (InvalidOperation, AttributeError, ValueError) as exc:
-        raise ValueError(f"Invalid order quantity: {quantity!r}.") from exc
-    if value <= 0:
-        raise ValueError("Order quantity must be greater than zero.")
-    return value.normalize()
+    return parse_positive_decimal(quantity, field="order quantity").normalize()
+
+
+def _optional_price(value: object, field: str) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    return parse_positive_decimal(value, field=field)
+
+
+def _fmt(value: Decimal) -> str:
+    return format(value, "f")
 
 
 def _quote_asset(symbol: str) -> str:
@@ -341,6 +706,21 @@ def _last_price(client: Spot, symbol: str) -> Decimal:
     return price
 
 
+def _to_usdt(client: Spot, asset: str, amount: Decimal) -> Decimal:
+    if amount == 0:
+        return Decimal("0")
+    if asset in STABLE_ASSETS:
+        return amount
+    pair = f"{asset}USDT"
+    try:
+        return amount * _last_price(client, pair)
+    except Exception as exc:
+        raise PermissionError(
+            f"SECURITY WARNING: Cannot value {asset} in USDT for the "
+            f"{_fmt(MAX_NOTIONAL_USDT)} USDT risk ceiling. No order was sent."
+        ) from exc
+
+
 def _portfolio_quote_value(
     balances: dict[str, Decimal],
     base_asset: str,
@@ -356,13 +736,82 @@ def _portfolio_quote_value(
     return quote_value
 
 
+def _symbol_filters(client: Spot, symbol: str) -> dict[str, Decimal]:
+    cached = _FILTER_CACHE.get(symbol)
+    if cached is not None:
+        return cached
+    raw = _invoke(client, "exchange_info", symbol=symbol)
+    payload = _as_mapping(raw)
+    symbols = payload.get("symbols") or []
+    tick = Decimal("0.00000001")
+    step = Decimal("0.00000001")
+    for item in symbols:
+        row = item if isinstance(item, Mapping) else _as_mapping(item)
+        if str(row.get("symbol", "")).upper() != symbol:
+            continue
+        for filt in row.get("filters") or []:
+            spec = filt if isinstance(filt, Mapping) else _as_mapping(filt)
+            kind = str(spec.get("filterType", ""))
+            if kind == "PRICE_FILTER":
+                tick = Decimal(str(spec.get("tickSize") or tick))
+            elif kind in {"LOT_SIZE", "MARKET_LOT_SIZE"}:
+                step = Decimal(str(spec.get("stepSize") or step))
+        break
+    filters = {"tick_size": tick if tick > 0 else Decimal("0.00000001"), "step_size": step if step > 0 else Decimal("0.00000001")}
+    _FILTER_CACHE[symbol] = filters
+    return filters
+
+
+def _quantize(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return value
+    quantized = (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+    exponent = max(0, -step.as_tuple().exponent)
+    return quantized.quantize(Decimal("1").scaleb(-exponent))
+
+
+def _quantize_price(client: Spot, symbol: str, price: Decimal) -> Decimal:
+    return _quantize(price, _symbol_filters(client, symbol)["tick_size"])
+
+
+def _quantize_quantity(client: Spot, symbol: str, quantity: Decimal) -> Decimal:
+    stepped = _quantize(quantity, _symbol_filters(client, symbol)["step_size"])
+    if stepped <= 0:
+        raise ValueError(f"Quantity {format(quantity, 'f')} is below the LOT_SIZE step for {symbol}.")
+    return stepped
+
+
+def _filled_quantity(exchange_response: Mapping[str, Any], fallback: Decimal) -> Decimal:
+    for key in ("executedQty", "origQty", "executed_qty"):
+        raw = exchange_response.get(key)
+        if raw is None:
+            continue
+        try:
+            value = Decimal(str(raw))
+        except (InvalidOperation, ValueError):
+            continue
+        if value > 0:
+            return value
+    return fallback
+
+
+def _close_spot_session(client: Spot) -> None:
+    session = getattr(client, "session", None)
+    closer = getattr(session, "close", None) if session is not None else None
+    if callable(closer):
+        try:
+            closer()
+        except Exception:
+            return
+
+
 def _enforce_exposure_limit(
     client: Spot,
     *,
     symbol: str,
     side: str,
     quantity: Decimal,
-) -> None:
+) -> dict[str, Decimal]:
     quote_asset = _quote_asset(symbol)
     base_asset = _base_asset(symbol, quote_asset)
     last_price = _last_price(client, symbol)
@@ -370,18 +819,14 @@ def _enforce_exposure_limit(
     account = _as_mapping(_invoke(client, "account"))
     balances = _balance_map(account.get("balances", []))
     portfolio = _portfolio_quote_value(balances, base_asset, quote_asset, last_price)
-    if portfolio <= 0:
-        raise PermissionError(
-            "Cannot size a Testnet order against an empty portfolio. No order was sent."
-        )
-    max_notional = portfolio * MAX_EXPOSURE_FRACTION
-    if notional > max_notional:
-        raise PermissionError(
-            f"Order notional {format(notional, 'f')} {quote_asset} exceeds the "
-            f"{format(MAX_EXPOSURE_FRACTION * 100, 'f')}% portfolio cap "
-            f"({format(max_notional, 'f')} {quote_asset} of "
-            f"{format(portfolio, 'f')} {quote_asset}). No order was sent."
-        )
+    portfolio_usdt = _to_usdt(client, quote_asset, portfolio)
+    notional_usdt = _to_usdt(client, quote_asset, notional)
+    effective_cap = enforce_size_limits(
+        notional_usdt=notional_usdt,
+        portfolio_usdt=portfolio_usdt,
+        symbol=symbol,
+        venue="spot",
+    )
     if side == "SELL" and quantity > balances.get(base_asset, Decimal("0")):
         raise PermissionError(
             f"Insufficient Testnet {base_asset} balance to SELL "
@@ -392,3 +837,8 @@ def _enforce_exposure_limit(
             f"Insufficient Testnet {quote_asset} balance to BUY "
             f"{format(quantity, 'f')} {base_asset}. No order was sent."
         )
+    return {
+        "effective_cap_usdt": effective_cap,
+        "portfolio_usdt": portfolio_usdt,
+        "notional_usdt": notional_usdt,
+    }

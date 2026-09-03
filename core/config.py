@@ -68,7 +68,8 @@ class Settings(BaseSettings):
     - ``BINANCE_SPOT_TESTNET_API_SECRET`` / ``SPOT_API_SECRET``
     - ``BINANCE_FUTURES_TESTNET_API_KEY`` / ``FUTURES_API_KEY``
     - ``BINANCE_FUTURES_TESTNET_API_SECRET`` / ``FUTURES_API_SECRET``
-    - ``LLM_API_KEY``
+    - ``LLM_API_KEY`` / ``GEMINI_API_KEY`` / ``GOOGLE_API_KEY``
+    - ``LLM_MODEL`` (default ``auto`` — pick a live flash model via ``client.models.list()``)
     """
 
     model_config = SettingsConfigDict(
@@ -121,7 +122,19 @@ class Settings(BaseSettings):
     llm_api_key: SecretStr = Field(
         ...,
         min_length=1,
-        validation_alias=AliasChoices("LLM_API_KEY", "llm_api_key"),
+        validation_alias=AliasChoices(
+            "LLM_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "llm_api_key",
+        ),
+        description="Google Gemini API key from Google AI Studio.",
+    )
+    llm_model: str = Field(
+        default="auto",
+        min_length=1,
+        validation_alias=AliasChoices("LLM_MODEL", "GEMINI_MODEL"),
+        description="Gemini model id, or 'auto' to select a live flash model from the API catalog.",
     )
 
     spot_base_url: str = Field(
@@ -135,6 +148,16 @@ class Settings(BaseSettings):
             "BINANCE_FUTURES_BASE_URL",
         ),
     )
+
+    @field_validator("llm_model", mode="before")
+    @classmethod
+    def _require_gemini_model(cls, value: object) -> str:
+        name = str(value).strip() if value is not None else ""
+        if name.lower().startswith("models/"):
+            name = name[7:].strip()
+        if not name or name.lower() in {"auto", "dynamic", "latest"}:
+            return "auto"
+        return name
 
     @field_validator("binance_env", mode="before")
     @classmethod
