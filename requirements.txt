@@ -1,0 +1,7 @@
+binance-connector
+pydantic>=2.0
+pydantic-settings
+python-dotenv
+rich
+aiohttp
+httpx
