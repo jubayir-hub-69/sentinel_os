@@ -23,11 +23,12 @@
 | [Agent Native / MCP Overview](https://developers.binance.com/en/docs/agent-native/overview) | Architecture, discovery, and tool-routing model |
 | [llms.txt](https://developers.binance.com/en/docs/llms.txt) / [llms-full.txt](https://developers.binance.com/en/docs/llms-full.txt) | Machine-readable API context for agent reasoning |
 | [Official MCP endpoint](https://agent.binance.com/mcp/agentic) | Capability **discovery only** — never a bypass around local guardrails |
+| Local MCP wrapper | [`mcp_server.py`](mcp_server.py) — official `mcp` SDK server for **all trade-related actions** |
 | [Binance Skills Hub](https://github.com/binance/binance-skills-hub) | Skill format — [`skills/binance/SKILL.md`](skills/binance/SKILL.md) |
 | [`binance-connector`](https://binance-connector.readthedocs.io/en/stable/getting_started.html) | Official Python Spot client, pinned to Testnet |
 | HMAC USDⓈ-M REST | Futures Testnet client pinned to `https://testnet.binancefuture.com` |
 
-Every utterance is routed locally: **intent → MCP policy layer → Testnet tool**. If the host, environment, size cap, kill-switch, or HITL check fails, the tool is never reached.
+Every utterance is routed locally: **intent → official MCP `tools/call` → Testnet tool**. The CLI is an MCP host (`mcp.Client`) talking to `mcp_server.py` (`sentinelos-testnet-mcp`). Standalone REST from the agent is forbidden. If the host, environment, size cap, kill-switch, or HITL check fails, the tool is never reached. Hosted MCP (`https://agent.binance.com/mcp/agentic`) is discovery-only.
 
 ---
 
@@ -37,8 +38,8 @@ Every utterance is routed locally: **intent → MCP policy layer → Testnet too
 python main.py
 ```
 
-1. Startup banner states **Binance Agent OS & MCP (Model Context Protocol)**, Testnet-only, HITL, 10% / $1,000 cap, kill-switch armed.
-2. `futures balance` shows the USDⓈ-M Testnet wallet (read-only).
+1. Startup banner states **Binance Agent OS & MCP**, then **Local MCP server ready** with `tools/list` names from `sentinelos-testnet-mcp`.
+2. `futures balance` is `tools/call get_futures_testnet_balance` (read-only USDⓈ-M Testnet wallet).
 3. `analyze BTCUSDT` fetches live Testnet tickers, then a Gemini reading from a **dynamically listed** flash model.
 4. `futures buy BTCUSDT 0.001 --sl 58000 --tp 62000` previews first. **Only `Y` submits.** `N` / Enter / anything else is denial.
 5. An oversized order prints **SECURITY WARNING** and is blocked even after `Y`.
@@ -141,26 +142,30 @@ Policy sources: [`policies/testnet_only.py`](policies/testnet_only.py), [`polici
 
 ```mermaid
 flowchart LR
-    U[User] -->|natural language| A[CLI Agent<br/>agent.py]
-    A -->|function call| P[MCP Policy Layer<br/>config · host allowlist · risk · HITL · kill]
-    P -->|all checks pass| T[Local Testnet tools]
+    U[User] -->|natural language| A[CLI Agent / MCP Host<br/>agent.py · mcp.Client]
+    A -->|tools/list tools/call| M[Local MCP Server<br/>mcp_server.py]
+    M -->|policy| P[config · host allowlist · risk · HITL · kill]
+    P -->|all checks pass| T[Testnet tool implementations]
     P -->|production / N / over-limit / kill| X[Fail-Closed Abort]
     T -->|Spot REST| S[testnet.binance.vision]
     T -->|Futures HMAC REST| F[testnet.binancefuture.com]
     T -->|Gemini generateContent| G[Google Gemini<br/>dynamic flash model]
     T --> AU[audit_log.txt]
+    A -.->|discovery only| H[agent.binance.com/mcp/agentic]
 ```
 
 | Layer | Path | Responsibility |
 | --- | --- | --- |
 | Entry | [`main.py`](main.py) | Agent OS / MCP startup banner, secure shutdown |
-| CLI Agent | [`agent.py`](agent.py) | Intent router, Rich UI, HITL `Y`/`N` |
+| CLI Agent | [`agent.py`](agent.py) | Intent router, Rich UI, HITL `Y`/`N` — MCP host only |
+| MCP server | [`mcp_server.py`](mcp_server.py) | Official `mcp` SDK server (`sentinelos-testnet-mcp`) |
+| MCP host | [`core/mcp_host.py`](core/mcp_host.py) | Official `mcp.Client` (`tools/list`, `tools/call`) |
 | Config | [`core/config.py`](core/config.py) | Frozen Testnet URLs, secret keys, Gemini `auto` model |
 | Policy | [`policies/`](policies/) + [`core/risk.py`](core/risk.py) + [`core/kill_switch.py`](core/kill_switch.py) | Host allowlist, 10% / $1,000, kill-switch |
 | Audit | [`core/audit.py`](core/audit.py) | Timestamped append-only log |
 | Skill | [`skills/binance/SKILL.md`](skills/binance/SKILL.md) | Agent OS instructions and MCP / llms.txt routing |
-| Spot tools | [`tools/binance_testnet_tools.py`](tools/binance_testnet_tools.py) | `binance-connector` Spot Testnet + SL/TP |
-| Futures tools | [`tools/binance_futures_testnet_tools.py`](tools/binance_futures_testnet_tools.py) | HMAC USDⓈ-M Futures Testnet + SL/TP |
+| Spot tools | [`tools/binance_testnet_tools.py`](tools/binance_testnet_tools.py) | `binance-connector` Spot Testnet + SL/TP (invoked only by MCP) |
+| Futures tools | [`tools/binance_futures_testnet_tools.py`](tools/binance_futures_testnet_tools.py) | HMAC USDⓈ-M Futures Testnet + SL/TP (invoked only by MCP) |
 | Analysis | [`tools/market_analysis.py`](tools/market_analysis.py) | Testnet tickers + Gemini (`google-genai`, dynamic flash) |
 
 ---
@@ -187,7 +192,13 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Dependencies: `binance-connector`, `pydantic>=2.0`, `pydantic-settings`, `python-dotenv`, `rich`, `aiohttp`, `httpx`, `google-genai`.
+Dependencies: `binance-connector`, `pydantic>=2.0`, `pydantic-settings`, `python-dotenv`, `rich`, `aiohttp`, `httpx`, `google-genai`, `mcp[cli]>=2.0` (official Model Context Protocol SDK).
+
+The CLI talks to the local MCP server. External MCP hosts (Claude Desktop, Inspector) can attach over stdio:
+
+```bash
+python mcp_server.py
+```
 
 Edit `.env`:
 

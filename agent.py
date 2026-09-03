@@ -1,9 +1,10 @@
 """SentinelOS conversational orchestrator (Track A).
 
 Fail-closed Spot + USDⓈ-M Futures Testnet CLI built on Binance Agent OS
-and MCP (Model Context Protocol). Keyword routing maps utterances to local
-tools. State-changing orders always require an explicit Y confirmation
-after a dry-run preview.
+and MCP (Model Context Protocol). Keyword routing maps utterances to
+**local MCP tools** via the official ``mcp.Client``. The agent never
+calls Binance REST wrappers directly. State-changing orders always
+require an explicit Y confirmation after a dry-run preview.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from rich.table import Table
 from rich.theme import Theme
 from rich.traceback import install as install_rich_traceback
 
-from core.audit import AUDIT_LOG_PATH, audit, read_recent
+from core.audit import AUDIT_LOG_PATH, audit
 from core.cli_parse import (
     AFFIRMATIVE,
     BALANCE_PATTERN,
@@ -38,24 +39,10 @@ from core.cli_parse import (
     parse_history_limit,
     parse_trade_intent,
 )
-from core.config import FUTURES_BASE_URL, SPOT_BASE_URL, get_settings
+from core.config import FUTURES_BASE_URL, SPOT_BASE_URL
 from core.kill_switch import KillSwitchActivated, get_kill_switch
+from core.mcp_host import SentinelMcpHost, build_mcp_client
 from core.risk import MAX_EXPOSURE_FRACTION, MAX_NOTIONAL_USDT
-from policies.testnet_only import verify_testnet_environment
-from tools.binance_futures_testnet_tools import (
-    FuturesTestnetClient,
-    create_futures_testnet_client,
-    get_futures_testnet_balance,
-    preview_futures_testnet_order,
-    submit_futures_testnet_order,
-)
-from tools.binance_testnet_tools import (
-    create_spot_testnet_client,
-    get_spot_testnet_balance,
-    preview_spot_testnet_order,
-    submit_spot_testnet_order,
-)
-from tools.market_analysis import analyze_symbol
 
 install_rich_traceback(show_locals=False)
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
@@ -75,11 +62,10 @@ CONSOLE = Console(theme=THEME)
 
 @dataclass
 class AgentRuntime:
-    """Process-wide CLI runtime. Clients are created only after Testnet checks pass."""
+    """Process-wide CLI runtime. Exchange I/O happens only through MCP tools."""
 
     console: Console
-    client: Any = None
-    futures_client: FuturesTestnetClient | None = None
+    mcp: SentinelMcpHost | None = None
     ready: bool = False
 
 
@@ -92,7 +78,8 @@ def render_banner() -> None:
         "[brand]SentinelOS[/brand]  ·  Binance Agent OS & MCP (Model Context Protocol)  ·  Track A\n"
         "[ok]Environment: TESTNET[/ok]  ·  Spot: "
         f"[info]{SPOT_BASE_URL}[/info]  ·  Futures: [info]{FUTURES_BASE_URL}[/info]\n"
-        "[muted]Fail-closed production block  ·  Human-in-the-loop required  ·  "
+        "[muted]Local MCP server: sentinelos-testnet-mcp  ·  Fail-closed production block  ·  "
+        "Human-in-the-loop required  ·  "
         f"Max {format(MAX_EXPOSURE_FRACTION * 100, 'f')}% of portfolio or "
         f"${format(MAX_NOTIONAL_USDT, 'f')} notional  ·  Kill-switch armed[/muted]\n\n"
         "Type [info]help[/info]  ·  [info]balance[/info]  ·  [info]analyze BTCUSDT[/info]  ·  "
@@ -103,7 +90,7 @@ def render_banner() -> None:
         Panel(
             body,
             title="[brand]SENTINEL OS  ·  AGENT OS / MCP[/brand]",
-            subtitle="[muted]Dry-Run / Testnet only  ·  MCP: agent.binance.com/mcp/agentic[/muted]",
+            subtitle="[muted]Dry-Run / Testnet only  ·  Local MCP wrapper  ·  hosted MCP is discovery-only[/muted]",
             border_style="cyan",
             box=box.DOUBLE,
         )
@@ -112,7 +99,7 @@ def render_banner() -> None:
 
 def render_help() -> None:
     table = Table(
-        title="Function-calling tools (Binance Agent OS & MCP)",
+        title="Local MCP tools (official mcp SDK · tools/call)",
         box=box.SIMPLE_HEAVY,
         header_style="bold cyan",
         expand=True,
@@ -151,13 +138,14 @@ def render_help() -> None:
         "preview_futures_testnet_order → submit_futures_testnet_order",
         "Futures Testnet; HITL Y/N required",
     )
-    table.add_row("history [N]", "audit_log.txt", "Show the latest N audit events")
-    table.add_row("kill", "kill_switch.trip", "Abort pending work and shut down")
+    table.add_row("history [N]", "read_audit_history", "Show the latest N audit events")
+    table.add_row("kill", "trip_kill_switch", "Abort pending work and shut down")
     table.add_row("help", "—", "Show this table")
     table.add_row("exit", "—", "Leave the agent")
     RUNTIME.console.print(table)
     RUNTIME.console.print(
-        "[muted]Architecture: Binance Agent OS & MCP (Model Context Protocol). "
+        "[muted]Architecture: Binance Agent OS & MCP. The CLI is an MCP host; "
+        "every trade/balance/analyze call is tools/call on sentinelos-testnet-mcp. "
         "Production hosts are rejected with RuntimeError. "
         "Unconfirmed orders are treated as denial. "
         f"Size cap: {format(MAX_EXPOSURE_FRACTION * 100, 'f')}% of portfolio "
@@ -236,84 +224,68 @@ def handle_exception(exc: BaseException) -> None:
     render_error(exc.__class__.__name__, message)
 
 
-def _close_clients() -> None:
-    if RUNTIME.futures_client is not None:
-        try:
-            RUNTIME.futures_client.close()
-        except Exception:
-            pass
-        RUNTIME.futures_client = None
-    if RUNTIME.client is not None:
-        session = getattr(RUNTIME.client, "session", None)
-        closer = getattr(session, "close", None) if session is not None else None
-        if callable(closer):
-            try:
-                closer()
-            except Exception:
-                pass
-        RUNTIME.client = None
+def _close_runtime() -> None:
+    try:
+        from mcp_server import shutdown_mcp_server
+
+        shutdown_mcp_server()
+    except Exception:
+        pass
+    RUNTIME.mcp = None
     RUNTIME.ready = False
 
 
-def bootstrap_runtime() -> None:
-    """Load fail-closed settings and pinned Testnet clients."""
-    switch = get_kill_switch()
-    switch.raise_if_tripped()
-    switch.register_shutdown_hook(_close_clients)
+def require_mcp() -> SentinelMcpHost:
+    get_kill_switch().raise_if_tripped()
+    if RUNTIME.mcp is None:
+        raise RuntimeError(
+            "Local MCP host is not connected. SentinelOS refuses to call Binance REST "
+            "outside the MCP protocol. Restart the agent after fixing Testnet config."
+        )
+    return RUNTIME.mcp
+
+
+async def bootstrap_mcp(host: SentinelMcpHost) -> None:
+    """Discover local MCP tools. No standalone REST from the CLI."""
+    get_kill_switch().raise_if_tripped()
+    RUNTIME.mcp = host
     try:
-        settings = get_settings()
-        verify_testnet_environment(settings.spot_base_url)
-        verify_testnet_environment(settings.futures_base_url)
-        settings.require_testnet_endpoint(settings.spot_base_url)
-        settings.require_testnet_endpoint(settings.futures_base_url)
-        RUNTIME.client = create_spot_testnet_client()
-        RUNTIME.futures_client = create_futures_testnet_client()
+        names = await host.discover()
+        environment: dict[str, Any] = {}
+        try:
+            environment = await host.read_json("sentinel://environment")
+        except Exception as exc:
+            audit("MCP_ERROR", "Failed to read sentinel://environment.", error=str(exc))
+        if environment and environment.get("environment") != "testnet":
+            raise RuntimeError("Blocked non-Testnet Binance host.")
         RUNTIME.ready = True
+        protocol = host.protocol_version or "mcp"
+        server = host.server_name or "sentinelos-testnet-mcp"
+        spot = environment.get("spot_base_url", SPOT_BASE_URL)
+        futures = environment.get("futures_base_url", FUTURES_BASE_URL)
         render_success(
-            "Testnet clients ready",
-            f"Spot pinned to [info]{settings.spot_base_url}[/info]. "
-            f"Futures pinned to [info]{settings.futures_base_url}[/info]. "
-            f"BINANCE_ENV=[ok]{settings.binance_env}[/ok]. "
-            f"Gemini=[info]{settings.llm_model}[/info] (dynamic flash catalog).",
+            "Local MCP server ready",
+            f"Server=[info]{server}[/info]  protocol=[info]{protocol}[/info]\n"
+            f"Discovered MCP tools: [info]{', '.join(names)}[/info]\n"
+            f"Spot pinned to [info]{spot}[/info]. "
+            f"Futures pinned to [info]{futures}[/info]. "
+            "Hosted MCP is discovery-only. Trades stay on this local wrapper.",
         )
         audit(
             "BOOT",
-            "Testnet clients ready.",
-            spot=settings.spot_base_url,
-            futures=settings.futures_base_url,
+            "MCP host connected to local Testnet server.",
+            server=server,
+            protocol=protocol,
+            tools=",".join(names),
         )
     except (ValidationError, RuntimeError, PermissionError, OSError, ValueError) as exc:
-        _close_clients()
+        RUNTIME.ready = False
         handle_exception(exc)
         render_warning(
             "Degraded mode",
-            "The CLI is up, but Binance tools will fail until Testnet configuration is valid. "
-            "No production endpoint will be used.",
+            "The CLI is up, but MCP tools will fail until Testnet configuration is valid. "
+            "No production endpoint will be used. No standalone REST fallback exists.",
         )
-
-
-def require_spot_client() -> Any:
-    get_kill_switch().raise_if_tripped()
-    if RUNTIME.client is None:
-        bootstrap_runtime()
-    if RUNTIME.client is None:
-        raise RuntimeError(
-            "Spot Testnet client is not available. Check BINANCE_ENV=testnet and "
-            "BINANCE_SPOT_TESTNET_API_KEY / BINANCE_SPOT_TESTNET_API_SECRET in .env."
-        )
-    return RUNTIME.client
-
-
-def require_futures_client() -> FuturesTestnetClient:
-    get_kill_switch().raise_if_tripped()
-    if RUNTIME.futures_client is None:
-        bootstrap_runtime()
-    if RUNTIME.futures_client is None:
-        raise RuntimeError(
-            "Futures Testnet client is not available. Check BINANCE_ENV=testnet and "
-            "BINANCE_FUTURES_TESTNET_API_KEY / BINANCE_FUTURES_TESTNET_API_SECRET in .env."
-        )
-    return RUNTIME.futures_client
 
 
 def render_balances(payload: dict[str, Any]) -> None:
@@ -517,41 +489,31 @@ async def confirm_order(venue: str) -> bool:
 
 
 async def tool_balance(venue: str = "spot") -> None:
-    if venue == "futures":
-        client = require_futures_client()
-        with RUNTIME.console.status("[info]Calling get_futures_testnet_balance on Testnet…[/info]"):
-            payload = await asyncio.to_thread(get_futures_testnet_balance, client)
-    else:
-        client = require_spot_client()
-        with RUNTIME.console.status("[info]Calling get_spot_testnet_balance on Testnet…[/info]"):
-            payload = await asyncio.to_thread(get_spot_testnet_balance, client)
+    host = require_mcp()
+    name = "get_futures_testnet_balance" if venue == "futures" else "get_spot_testnet_balance"
+    with RUNTIME.console.status(f"[info]MCP tools/call {name}…[/info]"):
+        payload = await host.call(name, {})
     render_balances(payload)
 
 
 async def tool_trade(intent: TradeIntent) -> None:
     get_kill_switch().raise_if_tripped()
-    if intent.venue == "futures":
-        with RUNTIME.console.status("[info]Building Futures order preview (dry-run, no execution)…[/info]"):
-            preview = await asyncio.to_thread(
-                preview_futures_testnet_order,
-                intent.symbol,
-                intent.side,
-                intent.quantity,
-                intent.stop_loss,
-                intent.take_profit,
-                require_futures_client(),
-            )
-    else:
-        with RUNTIME.console.status("[info]Building Spot order preview (dry-run, no execution)…[/info]"):
-            preview = await asyncio.to_thread(
-                preview_spot_testnet_order,
-                intent.symbol,
-                intent.side,
-                intent.quantity,
-                intent.stop_loss,
-                intent.take_profit,
-                require_spot_client(),
-            )
+    host = require_mcp()
+    preview_name = (
+        "preview_futures_testnet_order" if intent.venue == "futures" else "preview_spot_testnet_order"
+    )
+    submit_name = (
+        "submit_futures_testnet_order" if intent.venue == "futures" else "submit_spot_testnet_order"
+    )
+    preview_args = {
+        "symbol": intent.symbol,
+        "side": intent.side,
+        "quantity": intent.quantity,
+        "stop_loss": intent.stop_loss,
+        "take_profit": intent.take_profit,
+    }
+    with RUNTIME.console.status(f"[info]MCP tools/call {preview_name} (dry-run, no execution)…[/info]"):
+        preview = await host.call(preview_name, preview_args)
     render_preview(preview)
 
     if preview.get("environment") != "testnet" or preview.get("status") != "order_preview":
@@ -567,60 +529,59 @@ async def tool_trade(intent: TradeIntent) -> None:
         render_success(
             "Aborted",
             "User declined confirmation. No Testnet order was sent. "
-            "human_confirmed remains False.",
+            "human_confirmed remains False. MCP submit tool was not called.",
         )
         return
 
     get_kill_switch().raise_if_tripped()
     order = preview.get("order") or {}
-    if intent.venue == "futures":
-        client = require_futures_client()
-        with RUNTIME.console.status("[info]Calling submit_futures_testnet_order (human_confirmed=True)…[/info]"):
-            result = await asyncio.to_thread(
-                submit_futures_testnet_order,
-                client,
-                order.get("symbol", intent.symbol),
-                order.get("side", intent.side),
-                order.get("quantity", intent.quantity),
-                True,
-                order.get("stop_loss", intent.stop_loss),
-                order.get("take_profit", intent.take_profit),
-            )
-    else:
-        client = require_spot_client()
-        with RUNTIME.console.status("[info]Calling submit_spot_testnet_order (human_confirmed=True)…[/info]"):
-            result = await asyncio.to_thread(
-                submit_spot_testnet_order,
-                client,
-                order.get("symbol", intent.symbol),
-                order.get("side", intent.side),
-                order.get("quantity", intent.quantity),
-                True,
-                order.get("stop_loss", intent.stop_loss),
-                order.get("take_profit", intent.take_profit),
-            )
+    submit_args = {
+        "symbol": order.get("symbol", intent.symbol),
+        "side": order.get("side", intent.side),
+        "quantity": order.get("quantity", intent.quantity),
+        "human_confirmed": True,
+        "stop_loss": order.get("stop_loss", intent.stop_loss),
+        "take_profit": order.get("take_profit", intent.take_profit),
+    }
+    with RUNTIME.console.status(
+        f"[info]MCP tools/call {submit_name} (human_confirmed=true)…[/info]"
+    ):
+        result = await host.call(submit_name, submit_args)
     render_submit_result(result)
 
 
 async def tool_analyze(symbol: str) -> None:
-    with RUNTIME.console.status(f"[info]Fetching Testnet market data and running Gemini analysis for {symbol}…[/info]"):
-        payload = await asyncio.to_thread(analyze_symbol, symbol)
+    host = require_mcp()
+    with RUNTIME.console.status(
+        f"[info]MCP tools/call analyze_symbol for {symbol}…[/info]"
+    ):
+        payload = await host.call("analyze_symbol", {"symbol": symbol})
     render_analysis(payload)
 
 
 async def tool_history(limit: int) -> None:
-    lines = await asyncio.to_thread(read_recent, limit)
-    render_history(lines)
+    host = require_mcp()
+    payload = await host.call("read_audit_history", {"limit": limit})
+    render_history(list(payload.get("events") or []))
 
 
-def tool_kill() -> None:
-    get_kill_switch().trip(reason="CLI kill command")
+async def tool_kill() -> None:
+    host = RUNTIME.mcp
+    if host is not None:
+        try:
+            await host.call("trip_kill_switch", {"reason": "CLI kill command"})
+        except KillSwitchActivated:
+            pass
+        except Exception:
+            get_kill_switch().trip(reason="CLI kill command")
+    else:
+        get_kill_switch().trip(reason="CLI kill command")
     render_kill_switch()
     raise KillSwitchActivated("Emergency kill-switch activated.")
 
 
 async def process_intent(user_input: str) -> None:
-    """Keyword router: utterance → local Binance Testnet tool call."""
+    """Keyword router: utterance → local MCP tools/call (never raw REST)."""
     get_kill_switch().raise_if_tripped()
     text = user_input.strip()
     if not text:
@@ -630,7 +591,7 @@ async def process_intent(user_input: str) -> None:
     if lowered in EXIT_COMMANDS:
         raise KeyboardInterrupt
     if lowered in KILL_COMMANDS:
-        tool_kill()
+        await tool_kill()
         return
     if lowered in HELP_COMMANDS:
         render_help()
@@ -669,33 +630,36 @@ async def process_intent(user_input: str) -> None:
 
 async def main_loop() -> None:
     render_banner()
-    bootstrap_runtime()
-    RUNTIME.console.print(
-        "[muted]Listening. Ctrl+C, 'exit', or 'kill' to quit. All trades stay on Testnet.[/muted]"
-    )
+    client = build_mcp_client()
+    async with client:
+        host = SentinelMcpHost(client)
+        await bootstrap_mcp(host)
+        RUNTIME.console.print(
+            "[muted]Listening over MCP. Ctrl+C, 'exit', or 'kill' to quit. All trades stay on Testnet.[/muted]"
+        )
 
-    while True:
-        get_kill_switch().raise_if_tripped()
-        try:
-            user_input = await prompt_line("[bold cyan]sentinel[/bold cyan]")
-        except (EOFError, KeyboardInterrupt):
-            RUNTIME.console.print("\n[muted]Session closed.[/muted]")
-            _close_clients()
-            return
+        while True:
+            get_kill_switch().raise_if_tripped()
+            try:
+                user_input = await prompt_line("[bold cyan]sentinel[/bold cyan]")
+            except (EOFError, KeyboardInterrupt):
+                RUNTIME.console.print("\n[muted]Session closed.[/muted]")
+                _close_runtime()
+                return
 
-        try:
-            await process_intent(user_input)
-        except KillSwitchActivated:
-            _close_clients()
-            return
-        except KeyboardInterrupt:
-            RUNTIME.console.print("\n[muted]Session closed.[/muted]")
-            _close_clients()
-            return
-        except (ValidationError, RuntimeError, PermissionError, ValueError, OSError, httpx.HTTPError) as exc:
-            handle_exception(exc)
-        except Exception as exc:  # noqa: BLE001 — CLI must not crash on connector faults
-            handle_exception(exc)
+            try:
+                await process_intent(user_input)
+            except KillSwitchActivated:
+                _close_runtime()
+                return
+            except KeyboardInterrupt:
+                RUNTIME.console.print("\n[muted]Session closed.[/muted]")
+                _close_runtime()
+                return
+            except (ValidationError, RuntimeError, PermissionError, ValueError, OSError, httpx.HTTPError) as exc:
+                handle_exception(exc)
+            except Exception as exc:  # noqa: BLE001 — CLI must not crash on connector faults
+                handle_exception(exc)
 
 
 def main() -> None:
@@ -708,7 +672,7 @@ def main() -> None:
     except KeyboardInterrupt:
         CONSOLE.print("\n[muted]Session closed.[/muted]")
     finally:
-        _close_clients()
+        _close_runtime()
 
 
 if __name__ == "__main__":

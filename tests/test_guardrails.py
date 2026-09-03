@@ -132,6 +132,147 @@ def test_select_flash_models_from_catalog() -> None:
     assert all("pro" not in name.split("flash")[0] or "flash" in name for name in picked)
 
 
+def test_futures_sl_tp_uses_algo_order_endpoint() -> None:
+    from decimal import Decimal
+
+    from tools.binance_futures_testnet_tools import (
+        _ALGO_ORDER_PATH,
+        _FILTER_CACHE,
+        _place_futures_protection,
+    )
+
+    _FILTER_CACHE.clear()
+    client = _FakeFuturesClient()
+    result = _place_futures_protection(
+        client,
+        symbol="BTCUSDT",
+        entry_side="BUY",
+        quantity=Decimal("0.005"),
+        stop_loss=Decimal("50000"),
+        take_profit=Decimal("90000"),
+        position_side=None,
+    )
+    assert result["endpoint"] == _ALGO_ORDER_PATH
+    assert result["mode"] == "algo_conditional_exits"
+    assert len(client.calls) == 2
+    sl_path, sl_params = client.calls[0][1], client.calls[0][2]
+    tp_path, tp_params = client.calls[1][1], client.calls[1][2]
+    assert sl_path == _ALGO_ORDER_PATH
+    assert tp_path == _ALGO_ORDER_PATH
+    assert sl_params["algoType"] == "CONDITIONAL"
+    assert sl_params["type"] == "STOP_MARKET"
+    assert sl_params["side"] == "SELL"
+    assert sl_params["triggerPrice"] == "50000.00"
+    assert sl_params["quantity"] == "0.005"
+    assert sl_params["reduceOnly"] == "true"
+    assert sl_params["workingType"] == "CONTRACT_PRICE"
+    assert sl_params["timeInForce"] == "GTC"
+    assert "stopPrice" not in sl_params
+    assert tp_params["type"] == "TAKE_PROFIT_MARKET"
+    assert tp_params["triggerPrice"] == "90000.00"
+    assert all(path != "/fapi/v1/order" for _, path, _ in client.calls)
+
+
+def test_futures_sl_tp_retries_without_reduce_only() -> None:
+    from decimal import Decimal
+
+    from tools.binance_futures_testnet_tools import (
+        FuturesAPIError,
+        _FILTER_CACHE,
+        _place_futures_protection,
+    )
+
+    _FILTER_CACHE.clear()
+
+    def handler(params: dict) -> dict:
+        if params.get("reduceOnly") == "true":
+            raise FuturesAPIError(
+                400,
+                {"code": -1106, "msg": "Parameter 'reduceOnly' sent when not required."},
+            )
+        return {"algoId": 99, "algoStatus": "NEW", **params}
+
+    client = _FakeFuturesClient(algo_handler=handler)
+    result = _place_futures_protection(
+        client,
+        symbol="BTCUSDT",
+        entry_side="BUY",
+        quantity=Decimal("0.005"),
+        stop_loss=Decimal("50000"),
+        take_profit=None,
+        position_side=None,
+    )
+    assert "stop_loss" in result["exchange_response"]
+    assert any("reduceOnly" not in params and "closePosition" not in params for _, _, params in client.calls)
+    assert all(path == "/fapi/v1/algoOrder" for _, path, _ in client.calls)
+
+
+def test_futures_tp_still_placed_if_sl_is_rejected() -> None:
+    from decimal import Decimal
+
+    from tools.binance_futures_testnet_tools import (
+        FuturesAPIError,
+        _FILTER_CACHE,
+        _place_futures_protection,
+    )
+
+    _FILTER_CACHE.clear()
+
+    def handler(params: dict) -> dict:
+        if params.get("type") == "STOP_MARKET":
+            raise FuturesAPIError(400, {"code": -2021, "msg": "Order would immediately trigger."})
+        return {"algoId": 7, "algoStatus": "NEW", **params}
+
+    client = _FakeFuturesClient(algo_handler=handler)
+    try:
+        _place_futures_protection(
+            client,
+            symbol="BTCUSDT",
+            entry_side="BUY",
+            quantity=Decimal("0.005"),
+            stop_loss=Decimal("50000"),
+            take_profit=Decimal("90000"),
+            position_side=None,
+        )
+        raise AssertionError("expected RuntimeError")
+    except RuntimeError as exc:
+        assert "stop-loss" in str(exc)
+    tp_calls = [params for _, path, params in client.calls if params.get("type") == "TAKE_PROFIT_MARKET"]
+    assert tp_calls, "take-profit must still be attempted after a non-retryable SL reject"
+
+
+class _FakeFuturesClient:
+    def __init__(self, algo_handler=None) -> None:
+        self.calls: list[tuple[str, str, dict]] = []
+        self._algo_handler = algo_handler
+
+    def public(self, method: str, path: str, params=None):
+        if path == "/fapi/v1/exchangeInfo":
+            return {
+                "symbols": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "filters": [
+                            {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
+                            {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        ],
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected public {method} {path}")
+
+    def signed(self, method: str, path: str, params=None):
+        payload = dict(params or {})
+        self.calls.append((method, path, payload))
+        if path == "/fapi/v1/order":
+            raise AssertionError("conditional SL/TP must not use POST /fapi/v1/order")
+        if path != "/fapi/v1/algoOrder":
+            raise AssertionError(f"unexpected signed {method} {path}")
+        if self._algo_handler is not None:
+            return self._algo_handler(payload)
+        return {"algoId": 1, "algoStatus": "NEW", **payload}
+
+
 if __name__ == "__main__":
     tests = [
         test_parse_spot_sl_tp,
@@ -143,6 +284,9 @@ if __name__ == "__main__":
         test_size_limit_allows_within_cap,
         test_sl_tp_buy_rules,
         test_select_flash_models_from_catalog,
+        test_futures_sl_tp_uses_algo_order_endpoint,
+        test_futures_sl_tp_retries_without_reduce_only,
+        test_futures_tp_still_placed_if_sl_is_rejected,
     ]
     for test in tests:
         test()

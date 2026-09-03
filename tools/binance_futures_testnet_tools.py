@@ -37,6 +37,22 @@ logger = logging.getLogger(__name__)
 ALLOWED_SIDES: Final[frozenset[str]] = frozenset({"BUY", "SELL"})
 _ALLOWED_HOST: Final[str] = "testnet.binancefuture.com"
 _RECV_WINDOW: Final[int] = 5000
+_ALGO_ORDER_PATH: Final[str] = "/fapi/v1/algoOrder"
+# Parameter / routing errors that justify the next Algo payload.
+# Do not retry business rejects such as -2021 (would immediately trigger).
+_RETRYABLE_ALGO_CODES: Final[frozenset[int]] = frozenset(
+    {
+        -1102,
+        -1104,
+        -1106,
+        -1116,
+        -1130,
+        -2026,
+        -2027,
+        -4118,
+        -4120,
+    }
+)
 _FILTER_CACHE: dict[str, dict[str, Decimal]] = {}
 
 
@@ -432,34 +448,123 @@ def _place_futures_protection(
     take_profit: Decimal | None,
     position_side: str | None,
 ) -> dict[str, Any]:
+    """Attach reduce-only SL/TP via the USDⓈ-M Algo Order API.
+
+    Since 2025-12-09, ``STOP_MARKET`` / ``TAKE_PROFIT_MARKET`` are rejected on
+    ``POST /fapi/v1/order`` with ``-4120``. They must be sent to
+    ``POST /fapi/v1/algoOrder`` with ``algoType=CONDITIONAL`` and
+    ``triggerPrice``. MARKET entries stay on ``/fapi/v1/order``.
+    """
     protect_side = "SELL" if entry_side == "BUY" else "BUY"
     qty = _fmt(_quantize_quantity(client, symbol, quantity))
     placed: dict[str, Any] = {}
+    errors: list[str] = []
 
     def _conditional(kind: str, stop_price: Decimal) -> dict[str, Any]:
-        params: dict[str, Any] = {
-            "symbol": symbol,
-            "side": protect_side,
-            "type": kind,
-            "stopPrice": _fmt(_quantize_price(client, symbol, stop_price)),
-            "quantity": qty,
-            "workingType": "CONTRACT_PRICE",
-            "reduceOnly": "true",
-        }
-        if position_side is not None:
-            params["positionSide"] = position_side
-            params.pop("reduceOnly", None)
-        try:
-            return _as_mapping(client.signed("POST", "/fapi/v1/order", params))
-        except FuturesAPIError:
-            params.pop("reduceOnly", None)
-            return _as_mapping(client.signed("POST", "/fapi/v1/order", params))
+        trigger = _fmt(_quantize_price(client, symbol, stop_price))
+        last_error: Exception | None = None
+        for params in _algo_protection_attempts(
+            symbol=symbol,
+            side=protect_side,
+            kind=kind,
+            trigger=trigger,
+            quantity=qty,
+            position_side=position_side,
+        ):
+            try:
+                return _as_mapping(client.signed("POST", _ALGO_ORDER_PATH, params))
+            except FuturesAPIError as exc:
+                last_error = exc
+                if not _is_retryable_algo_error(exc):
+                    break
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"Unable to place Futures {kind} protection on Testnet.")
 
     if stop_loss is not None:
-        placed["stop_loss"] = _conditional("STOP_MARKET", stop_loss)
+        try:
+            placed["stop_loss"] = _conditional("STOP_MARKET", stop_loss)
+        except Exception as exc:
+            errors.append(f"stop-loss: {exc}")
     if take_profit is not None:
-        placed["take_profit"] = _conditional("TAKE_PROFIT_MARKET", take_profit)
-    return {"mode": "reduce_only_exits", "exchange_response": placed}
+        try:
+            placed["take_profit"] = _conditional("TAKE_PROFIT_MARKET", take_profit)
+        except Exception as exc:
+            errors.append(f"take-profit: {exc}")
+    if errors:
+        raise RuntimeError("Futures SL/TP protection failed: " + "; ".join(errors))
+    return {
+        "mode": "algo_conditional_exits",
+        "endpoint": _ALGO_ORDER_PATH,
+        "exchange_response": placed,
+    }
+
+
+def _algo_protection_attempts(
+    *,
+    symbol: str,
+    side: str,
+    kind: str,
+    trigger: str,
+    quantity: str,
+    position_side: str | None,
+) -> list[dict[str, Any]]:
+    """Build Algo Order payloads, most specific first.
+
+    1. Quantity + reduceOnly (one-way) or positionSide (hedge) with triggerPrice.
+    2. Same first payload with legacy stopPrice (some deployments still require it).
+    3. Quantity without reduceOnly (Algo may return -1106 for reduceOnly).
+    4. closePosition=true — fail-closed close-all if sized exits are rejected.
+    """
+    base: dict[str, Any] = {
+        "algoType": "CONDITIONAL",
+        "symbol": symbol,
+        "side": side,
+        "type": kind,
+        "triggerPrice": trigger,
+        "workingType": "CONTRACT_PRICE",
+        "timeInForce": "GTC",
+    }
+    if position_side is not None:
+        base["positionSide"] = position_side
+
+    sized = {**base, "quantity": quantity}
+    attempts: list[dict[str, Any]] = []
+    if position_side is None:
+        attempts.append({**sized, "reduceOnly": "true"})
+        attempts.append(dict(sized))
+    else:
+        attempts.append(dict(sized))
+
+    # Some Algo deployments still require the legacy stopPrice field name.
+    aliased = dict(attempts[0])
+    aliased.pop("triggerPrice", None)
+    aliased["stopPrice"] = trigger
+    attempts.insert(1, aliased)
+
+    close_all = {**base, "closePosition": "true"}
+    attempts.append(close_all)
+    return attempts
+
+
+def _is_retryable_algo_error(exc: FuturesAPIError) -> bool:
+    if exc.code in _RETRYABLE_ALGO_CODES:
+        return True
+    compact = str(exc.msg or "").lower().replace("_", "").replace(" ", "")
+    return any(
+        token in compact
+        for token in (
+            "reduceonly",
+            "mandatoryparameter",
+            "unknownparameter",
+            "unexpectedparameter",
+            "notallsentparameters",
+            "ordertypenotsupported",
+            "algoorder",
+            "stopprice",
+            "triggerprice",
+        )
+    )
 
 
 def _assert_futures_settings(settings: Settings) -> None:

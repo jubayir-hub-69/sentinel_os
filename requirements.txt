@@ -6,3 +6,4 @@ rich
 aiohttp
 httpx
 google-genai
+mcp[cli]>=2.0

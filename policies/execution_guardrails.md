@@ -10,8 +10,16 @@ Configuration and runtime checks are fail-closed: any attempt to use a
 production API host raises `RuntimeError` and the action is aborted.
 
 SentinelOS is built on **Binance Agent OS & MCP (Model Context Protocol)**
-architecture. Official MCP (`https://agent.binance.com/mcp/agentic`) is used
-for capability discovery only and is never a bypass around these guardrails.
+architecture. Official hosted MCP (`https://agent.binance.com/mcp/agentic`) is
+used for capability discovery only and is never a bypass around these
+guardrails.
+
+**Local MCP wrapper (required for trade-related actions).** Binance's Testnet
+guidance is to run your own MCP tool wrapper/server for trades. SentinelOS
+exposes Spot/Futures Testnet tools on the official Python MCP SDK server
+`mcp_server.py` (`sentinelos-testnet-mcp`). The CLI is an MCP host
+(`core/mcp_host.py` + `mcp.Client`). The agent must not call Binance REST
+wrappers directly. Every tool JSON includes `"environment": "testnet"`.
 
 ## Human-in-the-Loop Authorization
 

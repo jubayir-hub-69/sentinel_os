@@ -8,7 +8,7 @@ description: |
   optional SL/TP, inspect audit history, or trigger the kill-switch. Requires auth.
   Production Binance APIs are forbidden.
 metadata:
-  version: "1.2.0"
+  version: "1.3.0"
   author: SentinelOS
   environment: testnet
   venue: spot+futures
@@ -30,9 +30,12 @@ It does not promote any asset and does not execute production trades.
   `https://developers.binance.com/en/docs/llms-full.txt`) and to the Agent Native overview at
   `https://developers.binance.com/en/docs/agent-native/overview`.
 - Utilize `https://agent.binance.com/mcp/agentic` for advanced capability discovery if needed.
-- Route **all** trading intents exclusively through the local modules
-  `tools/binance_testnet_tools.py` and `tools/binance_futures_testnet_tools.py`.
-  Do not call `api.binance.com`, `fapi.binance.com`, or any other production host.
+  It is **discovery-only**. Never execute trades through the hosted MCP.
+- Route **all** trading intents exclusively through the local MCP server
+  `mcp_server.py` (`sentinelos-testnet-mcp`) using the official Model Context
+  Protocol (`tools/list`, `tools/call`). The CLI host is `core/mcp_host.py`.
+  Do not call Binance REST wrappers from the agent. Do not call
+  `api.binance.com`, `fapi.binance.com`, or any other production host.
 - SentinelOS operates strictly in Dry-Run/Testnet mode. Spot REST base URL is
   `https://testnet.binance.vision`. Futures REST base URL is
   `https://testnet.binancefuture.com`.
@@ -60,65 +63,63 @@ capabilities; never as a bypass around local Testnet guardrails.
 
 ## When to Use This Skill
 
-| User intent | Tool |
+| User intent | MCP tool (`tools/call`) |
 |-------------|------|
-| Show Spot Testnet balances / account | `get_spot_testnet_balance(client)` |
-| Show Futures Testnet balances | `get_futures_testnet_balance(client)` |
-| Technical / sentiment reading | `analyze_symbol(symbol)` |
-| Preview a Spot buy/sell (optional SL/TP) | `preview_spot_testnet_order(...)` |
-| Place a Spot Testnet order after confirm | `submit_spot_testnet_order(..., human_confirmed=True)` |
-| Preview a Futures buy/sell (optional SL/TP) | `preview_futures_testnet_order(...)` |
-| Place a Futures Testnet order after confirm | `submit_futures_testnet_order(..., human_confirmed=True)` |
-| Show recent audit events | `history` / `read_recent()` |
-| Emergency halt | `kill` / `get_kill_switch().trip()` |
+| Show Spot Testnet balances / account | `get_spot_testnet_balance` |
+| Show Futures Testnet balances | `get_futures_testnet_balance` |
+| Technical / sentiment reading | `analyze_symbol` |
+| Preview a Spot buy/sell (optional SL/TP) | `preview_spot_testnet_order` |
+| Place a Spot Testnet order after confirm | `submit_spot_testnet_order` (`human_confirmed=true`) |
+| Preview a Futures buy/sell (optional SL/TP) | `preview_futures_testnet_order` |
+| Place a Futures Testnet order after confirm | `submit_futures_testnet_order` (`human_confirmed=true`) |
+| Show recent audit events | `read_audit_history` |
+| Official MCP URL (no trades) | `discover_official_binance_mcp` |
+| Emergency halt | `trip_kill_switch` |
 
 ## Mandatory Tool Routing
 
+Trade-related actions go through the **local MCP server**, not standalone REST:
+
 ```python
-from tools.binance_testnet_tools import (
-    create_spot_testnet_client,
-    get_spot_testnet_balance,
-    preview_spot_testnet_order,
-    submit_spot_testnet_order,
-)
-from tools.binance_futures_testnet_tools import (
-    create_futures_testnet_client,
-    preview_futures_testnet_order,
-    submit_futures_testnet_order,
-)
-from tools.market_analysis import analyze_symbol
+from mcp import Client
+from mcp_server import mcp
 
-spot = create_spot_testnet_client()
-balances = get_spot_testnet_balance(spot)
-preview = preview_spot_testnet_order("BTCUSDT", "BUY", "0.001", stop_loss="58000", take_profit="62000")
-# After the user explicitly confirms the preview:
-result = submit_spot_testnet_order(
-    spot, "BTCUSDT", "BUY", "0.001",
-    human_confirmed=True, stop_loss="58000", take_profit="62000",
-)
+async with Client(mcp) as client:  # official MCP protocol
+    await client.list_tools()
+    balances = await client.call_tool("get_spot_testnet_balance", {})
+    preview = await client.call_tool(
+        "preview_spot_testnet_order",
+        {"symbol": "BTCUSDT", "side": "BUY", "quantity": "0.001",
+         "stop_loss": "58000", "take_profit": "62000"},
+    )
+    # After the user types Y:
+    result = await client.call_tool(
+        "submit_spot_testnet_order",
+        {"symbol": "BTCUSDT", "side": "BUY", "quantity": "0.001",
+         "human_confirmed": True, "stop_loss": "58000", "take_profit": "62000"},
+    )
+```
 
-futures = create_futures_testnet_client()
-f_preview = preview_futures_testnet_order("BTCUSDT", "BUY", "0.001")
-f_result = submit_futures_testnet_order(
-    futures, "BTCUSDT", "BUY", "0.001", human_confirmed=True,
-)
+Standalone stdio server for any MCP host:
 
-reading = analyze_symbol("BTCUSDT")
+```bash
+python mcp_server.py
 ```
 
 Clients load Testnet keys and pin hosts via `core.config.get_settings()`. If
 `BINANCE_ENV` is not `testnet` or the host is not an official Testnet host, the
-process raises `RuntimeError`.
+process raises `RuntimeError`. Submit tools default `human_confirmed=false`
+(denial). Every JSON result includes `"environment": "testnet"`.
 
 ## Tools
 
-| Function | Mutates funds | Behavior |
+| MCP tool | Mutates funds | Behavior |
 |----------|---------------|----------|
-| `get_spot_testnet_balance(client)` | No | Signed Spot Testnet account. |
-| `get_futures_testnet_balance(client)` | No | Signed Futures Testnet account. |
-| `analyze_symbol(symbol)` | No | Live Testnet tickers + Google Gemini. Model is selected dynamically via `client.models.list()` (first flash model that supports `generateContent`). |
-| `preview_*_testnet_order(...)` | No | Local dry-run. Returns `{"environment": "testnet", "status": "order_preview"}`. Enforces size limits. Does not call `new_order`. |
-| `submit_*_testnet_order(..., human_confirmed)` | Yes (Testnet only) | Requires `human_confirmed is True`. Enforces 10% / $1000 cap, then submits MARKET and optional SL/TP. |
+| `get_spot_testnet_balance` | No | Signed Spot Testnet account. |
+| `get_futures_testnet_balance` | No | Signed Futures Testnet account. |
+| `analyze_symbol` | No | Live Testnet tickers + Google Gemini. Model is selected dynamically via `client.models.list()` (first flash model that supports `generateContent`). |
+| `preview_*_testnet_order` | No | Local dry-run. Returns `{"environment": "testnet", "status": "order_preview"}`. Enforces size limits. Does not call `new_order`. |
+| `submit_*_testnet_order` | Yes (Testnet only) | Requires `human_confirmed=true`. Enforces 10% / $1000 cap, then submits MARKET and optional SL/TP. |
 
 ## Workflow
 
@@ -127,17 +128,17 @@ process raises `RuntimeError`.
    request depends on endpoint semantics, filters, or error codes.
 3. Discover extra official agent capabilities from `https://agent.binance.com/mcp/agentic` only
    if the local tools cannot answer a **read-only** discovery question. Do not execute trades
-   through MCP from this skill.
-4. For balance questions, call the matching Testnet balance tool.
-5. For `analyze SYMBOL`, call `analyze_symbol` and show the Testnet snapshot plus Gemini bullets. The model is resolved at runtime from the Gemini catalog.
+   through the **hosted** MCP. All Testnet trades use the local `sentinelos-testnet-mcp` server.
+4. For balance questions, `tools/call` the matching Testnet balance tool.
+5. For `analyze SYMBOL`, `tools/call analyze_symbol` and show the Testnet snapshot plus Gemini bullets. The model is resolved at runtime from the Gemini catalog.
 6. For any intended order:
-   1. Call the matching `preview_*_testnet_order` (include `--sl` / `--tp` when provided).
+   1. `tools/call` the matching `preview_*_testnet_order` (include `--sl` / `--tp` when provided).
    2. Show venue, symbol, side, type (`MARKET`), quantity, SL/TP, estimated notional, and the 10% / $1000 rule.
    3. Ask the user to type `Y` to confirm.
    4. Treat missing, implied, ambiguous, or timed-out replies as denial.
-   5. Only then call `submit_*_testnet_order(..., human_confirmed=True)`.
+   5. Only then `tools/call` `submit_*_testnet_order` with `human_confirmed=true`.
 7. If `PermissionError` or `RuntimeError` is raised, stop. Do not retry against another host.
-8. If the user types `kill`, trip the kill-switch and shut down.
+8. If the user types `kill`, `tools/call trip_kill_switch` and shut down.
 
 ## Security
 

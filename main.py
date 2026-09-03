@@ -19,7 +19,7 @@ CONSOLE = Console()
 
 STARTUP_BODY = (
     "[bold white]SentinelOS Initialized.[/bold white]\n"
-    "Architecture: [bold cyan]Binance Agent OS & MCP (Model Context Protocol)[/bold cyan]\n"
+    "Architecture: [bold cyan]Binance Agent OS & local MCP server (official mcp SDK)[/bold cyan]\n"
     "Status: [bold cyan]Autonomous Guardian Active[/bold cyan]\n"
     "Environment: [bold green]Strictly Binance Testnet (Spot + USDⓈ-M Futures)[/bold green]\n"
     "Safety Protocol: [bold yellow]Fail-Closed & Human-in-the-Loop Enforced.[/bold yellow]\n"
