@@ -39,6 +39,7 @@ from policies.testnet_only import verify_testnet_environment
 from tools.binance_futures_testnet_tools import (
     create_futures_testnet_client,
     get_futures_testnet_balance as _get_futures_balance,
+    get_futures_testnet_positions as _get_futures_positions,
     preview_futures_testnet_order as _preview_futures,
     submit_futures_testnet_order as _submit_futures,
 )
@@ -62,13 +63,18 @@ _futures_client: Any = None
 mcp = MCPServer(
     name="sentinelos-testnet-mcp",
     title="SentinelOS Testnet MCP",
-    version="1.0.0",
+    version="1.1.0",
     instructions=(
         "SentinelOS local MCP server for Binance Agent OS Track A. "
         "Environment is strictly Binance Testnet (Spot + USDⓈ-M Futures). "
         "Official hosted MCP (https://agent.binance.com/mcp/agentic) is discovery-only. "
         "ALL trade-related actions MUST go through these local tools. "
         "Never call api.binance.com or fapi.binance.com. "
+        "Multi-step natural language MUST be orchestrated as chained tools/call: "
+        "read-only first (get_spot_testnet_balance / get_futures_testnet_balance / "
+        "get_futures_testnet_positions / analyze_symbol), then compute any percent "
+        "size locally, then preview_*_testnet_order, then STOP for an explicit human Y. "
+        "NEVER call submit_* until the human types Y in this turn. "
         "Preview first. Submit tools require human_confirmed=true after an explicit "
         "human Y. human_confirmed defaults to false (denial). "
         "Hard cap: min(10% of Testnet equity, 1000 USDT notional). "
@@ -201,6 +207,21 @@ def get_futures_testnet_balance() -> dict[str, Any]:
     """
     audit("MCP_TOOL", "get_futures_testnet_balance", venue="futures")
     return _invoke_guarded(_get_futures_balance, _futures())
+
+
+@mcp.tool(
+    title="Futures Testnet open positions",
+    annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=True),
+)
+def get_futures_testnet_positions(symbol: str | None = None) -> dict[str, Any]:
+    """Fetch currently open USDⓈ-M Futures Testnet positions. Read-only.
+
+    Returns symbol, position side, entry price, unrealized PnL, and position
+    size. JSON includes environment=testnet. Does not place or cancel an order.
+    Optional symbol filters to one contract; omit it to list every open position.
+    """
+    audit("MCP_TOOL", "get_futures_testnet_positions", venue="futures", symbol=symbol or "")
+    return _invoke_guarded(_get_futures_positions, _futures(), _optional(symbol))
 
 
 @mcp.tool(
@@ -482,6 +503,26 @@ def confirm_testnet_order(venue: str, symbol: str, side: str, quantity: str) -> 
         "Only if they type exactly Y may you call the matching submit_* MCP tool "
         "with human_confirmed=true. Anything else is denial. "
         "Do not call production hosts. Do not raise quantity after confirmation."
+    )
+
+
+@mcp.prompt(title="Orchestrate a multi-step Testnet workflow")
+def orchestrate_testnet_workflow(utterance: str) -> str:
+    """Chain local MCP tools for compound natural language. Preview, then HITL."""
+    return (
+        "You are SentinelOS, a fail-closed Binance Testnet MCP host. "
+        f"User utterance: {utterance!r}. "
+        "Orchestrate ONLY these local tools, in this order when the request needs them: "
+        "1) get_spot_testnet_balance or get_futures_testnet_balance (read-only). "
+        "2) analyze_symbol (read-only Testnet tickers + Gemini). "
+        "3) get_futures_testnet_positions when the user asks about open Futures positions. "
+        "4) Compute any percent-of-available size locally. Cap at min(10% of equity, 1000 USDT). "
+        "5) If the user asked to prepare/preview an order, call preview_spot_testnet_order "
+        "or preview_futures_testnet_order. "
+        "6) STOP. Present the preview. Wait for an explicit human Y. "
+        "Never call submit_spot_testnet_order or submit_futures_testnet_order unless the "
+        "human typed Y against this exact preview. human_confirmed defaults to false (denial). "
+        "Never call production hosts. Never skip the preview. Never invent confirmation."
     )
 
 

@@ -189,6 +189,43 @@ def get_futures_testnet_balance(client: FuturesTestnetClient) -> dict[str, Any]:
     }
 
 
+def get_futures_testnet_positions(
+    client: FuturesTestnetClient,
+    symbol: str | None = None,
+) -> dict[str, Any]:
+    """Fetch currently open USDⓈ-M Futures Testnet positions. Read-only.
+
+    Returns symbol, position side, entry price, unrealized PnL, and position
+    size for every non-zero position. Never places, cancels, or modifies an
+    order.
+    """
+    _guard_futures_client(client)
+    normalized_symbol = _normalize_symbol(symbol) if symbol else None
+    rows = _position_risk_rows(client, normalized_symbol)
+    positions = _open_positions_from_rows(rows, normalized_symbol)
+    audit(
+        "API_CALL",
+        "GET Futures Testnet open positions.",
+        venue="futures",
+        symbol=normalized_symbol,
+        open_count=len(positions),
+    )
+    return {
+        "environment": "testnet",
+        "status": "open_positions",
+        "venue": "futures",
+        "base_url": client.base_url,
+        "read_only": True,
+        "symbol_filter": normalized_symbol,
+        "open_count": len(positions),
+        "positions": positions,
+        "message": (
+            "Read-only Futures Testnet snapshot. No order was sent and no "
+            "production host was contacted."
+        ),
+    }
+
+
 def get_futures_testnet_ticker(symbol: str, client: FuturesTestnetClient | None = None) -> dict[str, Any]:
     """Fetch last price and 24h ticker from Futures Testnet (read-only)."""
     own = client is None
@@ -659,6 +696,108 @@ def _account(client: FuturesTestnetClient) -> dict[str, Any]:
     if last_error is not None:
         raise last_error
     raise RuntimeError("Unable to load Futures Testnet account.")
+
+
+def _position_risk_rows(client: FuturesTestnetClient, symbol: str | None) -> list[Any]:
+    """Load position rows from positionRisk, falling back to account.positions."""
+    params: dict[str, Any] = {}
+    if symbol:
+        params["symbol"] = symbol
+    last_error: Exception | None = None
+    for path in ("/fapi/v2/positionRisk", "/fapi/v3/positionRisk", "/fapi/v1/positionRisk"):
+        try:
+            raw = client.signed("GET", path, params)
+        except FuturesAPIError as exc:
+            last_error = exc
+            if exc.status in {404, 405} or exc.code in {-4046, -1121}:
+                continue
+            raise
+        if isinstance(raw, list):
+            return raw
+        if isinstance(raw, Mapping):
+            inner = raw.get("positions")
+            if isinstance(inner, list):
+                return inner
+            return [raw]
+    account = _account(client)
+    positions = account.get("positions")
+    if isinstance(positions, list):
+        return positions
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Unable to load Futures Testnet positions.")
+
+
+def _is_open_position(row: Mapping[str, Any]) -> bool:
+    raw = row.get("positionAmt", row.get("position_amt", "0"))
+    try:
+        return Decimal(str(raw if raw is not None else "0")) != 0
+    except (InvalidOperation, ValueError):
+        return False
+
+
+def _position_decimal_str(value: object, default: str = "0") -> str:
+    try:
+        parsed = Decimal(str(value if value is not None else default))
+    except (InvalidOperation, ValueError):
+        return default
+    return format(parsed, "f")
+
+
+def _normalize_position(row: Mapping[str, Any]) -> dict[str, str]:
+    amt_raw = row.get("positionAmt", row.get("position_amt", "0"))
+    try:
+        amt = Decimal(str(amt_raw if amt_raw is not None else "0"))
+    except (InvalidOperation, ValueError):
+        amt = Decimal("0")
+    api_side = str(row.get("positionSide") or row.get("position_side") or "BOTH").upper()
+    if api_side in {"LONG", "SHORT"}:
+        direction = api_side
+    else:
+        direction = "SHORT" if amt < 0 else "LONG"
+    isolated = row.get("isolated")
+    margin_type = str(row.get("marginType") or row.get("margin_type") or "")
+    if not margin_type:
+        margin_type = "isolated" if isolated in {True, "true", "TRUE"} else "cross"
+    pnl = row.get(
+        "unRealizedProfit",
+        row.get("unrealizedProfit", row.get("unrealized_pnl", "0")),
+    )
+    return {
+        "symbol": str(row.get("symbol", "")).upper(),
+        "position_side": api_side,
+        "direction": direction,
+        "entry_price": _position_decimal_str(row.get("entryPrice", row.get("entry_price"))),
+        "unrealized_pnl": _position_decimal_str(pnl),
+        "position_size": _position_decimal_str(amt),
+        "mark_price": _position_decimal_str(row.get("markPrice", row.get("mark_price"))),
+        "notional": _position_decimal_str(row.get("notional")),
+        "leverage": str(row.get("leverage", "")),
+        "liquidation_price": _position_decimal_str(
+            row.get("liquidationPrice", row.get("liquidation_price"))
+        ),
+        "margin_type": margin_type,
+        "update_time": str(row.get("updateTime", row.get("update_time", ""))),
+    }
+
+
+def _open_positions_from_rows(rows: object, symbol: str | None = None) -> list[dict[str, str]]:
+    """Filter exchange position rows down to currently open Testnet positions."""
+    opened: list[dict[str, str]] = []
+    if not isinstance(rows, list):
+        return opened
+    wanted = symbol.upper() if symbol else None
+    for item in rows:
+        row = item if isinstance(item, Mapping) else {}
+        if not _is_open_position(row):
+            continue
+        normalized = _normalize_position(row)
+        if wanted and normalized["symbol"] != wanted:
+            continue
+        if not normalized["symbol"]:
+            continue
+        opened.append(normalized)
+    return opened
 
 
 def _wallet_usdt(account: Mapping[str, Any]) -> tuple[Decimal, Decimal]:

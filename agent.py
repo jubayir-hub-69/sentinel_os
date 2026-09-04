@@ -1,10 +1,12 @@
 """SentinelOS conversational orchestrator (Track A).
 
 Fail-closed Spot + USDⓈ-M Futures Testnet CLI built on Binance Agent OS
-and MCP (Model Context Protocol). Keyword routing maps utterances to
-**local MCP tools** via the official ``mcp.Client``. The agent never
-calls Binance REST wrappers directly. State-changing orders always
-require an explicit Y confirmation after a dry-run preview.
+and MCP (Model Context Protocol). Keyword routing maps utterances to **local MCP tools** via the official
+``mcp.Client``. Compound natural language is orchestrated as a chained
+MCP workflow (balance → analyze → local percent math → preview) that
+always stops for an explicit Y. The agent never calls Binance REST
+wrappers directly. State-changing orders always require an explicit Y
+confirmation after a dry-run preview.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import asyncio
 import logging
 import sys
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -35,14 +38,35 @@ from core.cli_parse import (
     HELP_COMMANDS,
     KILL_COMMANDS,
     TradeIntent,
+    WorkflowIntent,
+    looks_like_compound_workflow,
     parse_analyze_symbol,
     parse_history_limit,
+    parse_positions_intent,
     parse_trade_intent,
+    parse_workflow_intent,
 )
 from core.config import FUTURES_BASE_URL, SPOT_BASE_URL
 from core.kill_switch import KillSwitchActivated, get_kill_switch
 from core.mcp_host import SentinelMcpHost, build_mcp_client
+from core.planner import (
+    assess_market_stability,
+    available_quote,
+    format_quantity,
+    last_price_from_analysis,
+    llm_plan_workflow,
+    quantity_from_percent,
+)
 from core.risk import MAX_EXPOSURE_FRACTION, MAX_NOTIONAL_USDT
+
+# Submit MCP tools are forbidden inside the planner. The only path to submit
+# is tool_trade() after an explicit Y on the exact preview.
+_WORKFLOW_FORBIDDEN_TOOLS = frozenset(
+    {
+        "submit_spot_testnet_order",
+        "submit_futures_testnet_order",
+    }
+)
 
 install_rich_traceback(show_locals=False)
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
@@ -82,9 +106,12 @@ def render_banner() -> None:
         "Human-in-the-loop required  ·  "
         f"Max {format(MAX_EXPOSURE_FRACTION * 100, 'f')}% of portfolio or "
         f"${format(MAX_NOTIONAL_USDT, 'f')} notional  ·  Kill-switch armed[/muted]\n\n"
-        "Type [info]help[/info]  ·  [info]balance[/info]  ·  [info]analyze BTCUSDT[/info]  ·  "
+        "Type [info]help[/info]  ·  [info]balance[/info]  ·  [info]positions[/info]  ·  "
+        "[info]analyze BTCUSDT[/info]  ·  "
         "[info]buy BTCUSDT 0.001 --sl 58000 --tp 62000[/info]  ·  "
-        "[info]futures buy BTCUSDT 0.001[/info]  ·  [info]history[/info]  ·  [info]kill[/info]"
+        "[info]futures buy BTCUSDT 0.001[/info]  ·  [info]history[/info]  ·  [info]kill[/info]\n"
+        "[muted]Compound:[/muted] Check my spot balance, analyze ETHUSDT, and if the market looks "
+        "stable, prepare a spot order to buy using 5% of my available USDT."
     )
     console.print(
         Panel(
@@ -138,6 +165,16 @@ def render_help() -> None:
         "preview_futures_testnet_order → submit_futures_testnet_order",
         "Futures Testnet; HITL Y/N required",
     )
+    table.add_row(
+        "positions [SYMBOL]",
+        "get_futures_testnet_positions",
+        "Read-only open USDⓈ-M Futures Testnet positions",
+    )
+    table.add_row(
+        "compound natural language",
+        "chained MCP tools → preview → Y/N",
+        "Balance + analyze + % size; submit never skipped",
+    )
     table.add_row("history [N]", "read_audit_history", "Show the latest N audit events")
     table.add_row("kill", "trip_kill_switch", "Abort pending work and shut down")
     table.add_row("help", "—", "Show this table")
@@ -145,9 +182,10 @@ def render_help() -> None:
     RUNTIME.console.print(table)
     RUNTIME.console.print(
         "[muted]Architecture: Binance Agent OS & MCP. The CLI is an MCP host; "
-        "every trade/balance/analyze call is tools/call on sentinelos-testnet-mcp. "
+        "every trade/balance/analyze/positions call is tools/call on sentinelos-testnet-mcp. "
+        "Compound utterances are orchestrated as chained MCP tools, then a dry-run preview. "
         "Production hosts are rejected with RuntimeError. "
-        "Unconfirmed orders are treated as denial. "
+        "Unconfirmed orders are treated as denial. Submit is never part of a plan. "
         f"Size cap: {format(MAX_EXPOSURE_FRACTION * 100, 'f')}% of portfolio "
         f"or ${format(MAX_NOTIONAL_USDT, 'f')} USDT, whichever is smaller.[/muted]"
     )
@@ -341,6 +379,95 @@ def render_balances(payload: dict[str, Any]) -> None:
     RUNTIME.console.print(f"[muted]{flags}[/muted]")
 
 
+def render_positions(payload: dict[str, Any]) -> None:
+    rows = payload.get("positions") or []
+    title = (
+        f"Futures Testnet open positions  ·  {payload.get('base_url', FUTURES_BASE_URL)}"
+    )
+    table = Table(title=title, box=box.SIMPLE_HEAVY, header_style="bold cyan", expand=True)
+    table.add_column("Symbol", style="brand")
+    table.add_column("Side")
+    table.add_column("Entry", justify="right")
+    table.add_column("Size", justify="right")
+    table.add_column("uPnL", justify="right", style="ok")
+    table.add_column("Mark", justify="right")
+    table.add_column("Notional", justify="right")
+    if not rows:
+        table.add_row("—", "none", "0", "0", "0", "0", "0")
+    else:
+        for row in rows:
+            table.add_row(
+                str(row.get("symbol", "")),
+                str(row.get("position_side") or row.get("direction") or "—"),
+                str(row.get("entry_price", "0")),
+                str(row.get("position_size", "0")),
+                str(row.get("unrealized_pnl", "0")),
+                str(row.get("mark_price", "—")),
+                str(row.get("notional", "—")),
+            )
+    RUNTIME.console.print(table)
+    RUNTIME.console.print(
+        f"[muted]environment={payload.get('environment')}  venue={payload.get('venue')}  "
+        f"read_only={payload.get('read_only')}  open_count={payload.get('open_count')}  "
+        f"status={payload.get('status')}[/muted]"
+    )
+
+
+def render_workflow_plan(intent: WorkflowIntent) -> None:
+    steps: list[str] = []
+    index = 1
+    if intent.check_spot_balance:
+        steps.append(f"{index}. MCP [info]get_spot_testnet_balance[/info] (read-only)")
+        index += 1
+    if intent.check_futures_balance:
+        steps.append(f"{index}. MCP [info]get_futures_testnet_balance[/info] (read-only)")
+        index += 1
+    if intent.check_futures_positions:
+        steps.append(f"{index}. MCP [info]get_futures_testnet_positions[/info] (read-only)")
+        index += 1
+    if intent.analyze_symbol:
+        steps.append(
+            f"{index}. MCP [info]analyze_symbol[/info] [brand]{intent.analyze_symbol}[/brand]"
+        )
+        index += 1
+    if intent.require_stable:
+        steps.append(f"{index}. Local stability gate (fail-closed if unstable)")
+        index += 1
+    if intent.percent_of_available and intent.trade_side:
+        steps.append(
+            f"{index}. Local math: {intent.percent_of_available}% of available "
+            f"{intent.percent_asset} → {intent.trade_side} {intent.trade_symbol}"
+        )
+        index += 1
+    if intent.trade_side and intent.trade_symbol:
+        preview_name = (
+            "preview_futures_testnet_order"
+            if intent.trade_venue == "futures"
+            else "preview_spot_testnet_order"
+        )
+        steps.append(f"{index}. MCP [info]{preview_name}[/info] (dry-run, no fill)")
+        index += 1
+        steps.append(
+            f"{index}. [warn]STOP[/warn] — Human-in-the-loop Y/N. "
+            "Submit MCP tools are not called unless you type Y."
+        )
+    forbidden = ", ".join(sorted(_WORKFLOW_FORBIDDEN_TOOLS))
+    body = "\n".join(steps) if steps else "No MCP steps planned."
+    body += (
+        f"\n\n[muted]Never auto-chained: {forbidden}. "
+        "human_confirmed remains false until an explicit Y.[/muted]"
+    )
+    RUNTIME.console.print(
+        Panel(
+            body,
+            title="[brand]AGENTIC WORKFLOW  ·  MCP ORCHESTRATION[/brand]",
+            subtitle="[muted]Testnet only  ·  preview then HITL  ·  submit is never auto-chained[/muted]",
+            border_style="cyan",
+            box=box.ROUNDED,
+        )
+    )
+
+
 def render_preview(preview: dict[str, Any]) -> None:
     order = preview.get("order") or {}
     risk = preview.get("risk") or {}
@@ -488,12 +615,24 @@ async def confirm_order(venue: str) -> bool:
     return confirmed
 
 
-async def tool_balance(venue: str = "spot") -> None:
+async def tool_balance(venue: str = "spot") -> dict[str, Any]:
     host = require_mcp()
     name = "get_futures_testnet_balance" if venue == "futures" else "get_spot_testnet_balance"
     with RUNTIME.console.status(f"[info]MCP tools/call {name}…[/info]"):
         payload = await host.call(name, {})
     render_balances(payload)
+    return payload
+
+
+async def tool_positions(symbol: str | None = None) -> dict[str, Any]:
+    host = require_mcp()
+    arguments: dict[str, Any] = {}
+    if symbol:
+        arguments["symbol"] = symbol
+    with RUNTIME.console.status("[info]MCP tools/call get_futures_testnet_positions…[/info]"):
+        payload = await host.call("get_futures_testnet_positions", arguments)
+    render_positions(payload)
+    return payload
 
 
 async def tool_trade(intent: TradeIntent) -> None:
@@ -550,13 +689,143 @@ async def tool_trade(intent: TradeIntent) -> None:
     render_submit_result(result)
 
 
-async def tool_analyze(symbol: str) -> None:
+async def tool_analyze(symbol: str) -> dict[str, Any]:
     host = require_mcp()
     with RUNTIME.console.status(
         f"[info]MCP tools/call analyze_symbol for {symbol}…[/info]"
     ):
         payload = await host.call("analyze_symbol", {"symbol": symbol})
     render_analysis(payload)
+    return payload
+
+
+async def tool_workflow(intent: WorkflowIntent) -> None:
+    """Execute a multi-step plan via MCP tools, then HITL. Never auto-submit."""
+    get_kill_switch().raise_if_tripped()
+    audit(
+        "WORKFLOW_PLAN",
+        "Executing agentic MCP workflow.",
+        spot_balance=intent.check_spot_balance,
+        futures_balance=intent.check_futures_balance,
+        positions=intent.check_futures_positions,
+        analyze=intent.analyze_symbol,
+        require_stable=intent.require_stable,
+        venue=intent.trade_venue,
+        side=intent.trade_side,
+        symbol=intent.trade_symbol,
+        percent=intent.percent_of_available,
+    )
+    render_workflow_plan(intent)
+
+    spot_balance: dict[str, Any] | None = None
+    futures_balance: dict[str, Any] | None = None
+    analysis: dict[str, Any] | None = None
+
+    if intent.check_spot_balance:
+        spot_balance = await tool_balance("spot")
+    if intent.check_futures_balance:
+        futures_balance = await tool_balance("futures")
+    if intent.check_futures_positions:
+        await tool_positions()
+
+    analyze_symbol = intent.analyze_symbol or (intent.trade_symbol if intent.percent_of_available else None)
+    if analyze_symbol:
+        analysis = await tool_analyze(analyze_symbol)
+
+    if intent.require_stable:
+        stable, reason = assess_market_stability(analysis)
+        audit("WORKFLOW_STEP", "Stability gate.", stable=stable, reason=reason)
+        if not stable:
+            render_warning(
+                "Market stability gate",
+                f"{reason}\nNo Testnet order was prepared. "
+                "preview_* and submit_* MCP tools were not called.",
+            )
+            return
+        render_success("Market looks stable", reason)
+
+    if not intent.trade_side or not intent.trade_symbol:
+        return
+
+    quantity = await _workflow_quantity(intent, spot_balance, futures_balance, analysis)
+    trade = TradeIntent(
+        venue=intent.trade_venue or "spot",
+        side=intent.trade_side,
+        symbol=intent.trade_symbol,
+        quantity=quantity,
+        stop_loss=intent.stop_loss,
+        take_profit=intent.take_profit,
+    )
+    # Reuses the existing preview → Y/N → submit path. The planner cannot
+    # confirm an order or call a submit MCP tool on its own.
+    await tool_trade(trade)
+
+
+async def _workflow_quantity(
+    intent: WorkflowIntent,
+    spot_balance: dict[str, Any] | None,
+    futures_balance: dict[str, Any] | None,
+    analysis: dict[str, Any] | None,
+) -> str:
+    """Size a percent-of-available order locally. Fail-closed on missing data."""
+    if not intent.percent_of_available:
+        raise ValueError(
+            "Compound workflow is missing an explicit quantity. "
+            "Use a percent of available USDT or a simple buy/sell command."
+        )
+    venue = intent.trade_venue or "spot"
+    if venue == "futures":
+        if futures_balance is None:
+            futures_balance = await tool_balance("futures")
+        available = available_quote(futures_balance, intent.percent_asset)
+    else:
+        if spot_balance is None:
+            spot_balance = await tool_balance("spot")
+        available = available_quote(spot_balance, intent.percent_asset)
+
+    last_price = last_price_from_analysis(analysis, venue=venue)
+    if last_price <= 0:
+        if intent.trade_symbol:
+            analysis = await tool_analyze(intent.trade_symbol)
+            last_price = last_price_from_analysis(analysis, venue=venue)
+    if last_price <= 0:
+        raise RuntimeError(
+            "Cannot size a percent order without a positive Testnet last price. "
+            "No preview was built and no order was sent."
+        )
+
+    sized = quantity_from_percent(
+        available_usdt=available,
+        percent=Decimal(str(intent.percent_of_available)),
+        last_price=last_price,
+    )
+    quantity_dec = Decimal(str(sized["quantity"]))
+    notional_dec = Decimal(str(sized["notional_usdt"]))
+    quantity = format_quantity(quantity_dec)
+    audit(
+        "WORKFLOW_STEP",
+        "Computed percent-of-available size.",
+        percent=intent.percent_of_available,
+        available=format(available, "f"),
+        last_price=format(last_price, "f"),
+        quantity=quantity,
+        notional=format(notional_dec, "f"),
+        capped=sized["capped"],
+    )
+    note = (
+        f"{intent.percent_of_available}% of available {intent.percent_asset} "
+        f"{format(available, 'f')} @ last {format(last_price, 'f')} → "
+        f"qty {quantity} (notional {format(notional_dec, 'f')} USDT)."
+    )
+    if sized["capped"]:
+        render_warning(
+            "Size reduced to risk cap",
+            note + f"\nEffective ceiling is min({format(MAX_EXPOSURE_FRACTION * 100, 'f')}% of "
+            f"available, {format(MAX_NOTIONAL_USDT, 'f')} USDT).",
+        )
+    else:
+        render_success("Sized from available USDT", note)
+    return quantity
 
 
 async def tool_history(limit: int) -> None:
@@ -581,7 +850,11 @@ async def tool_kill() -> None:
 
 
 async def process_intent(user_input: str) -> None:
-    """Keyword router: utterance → local MCP tools/call (never raw REST)."""
+    """Route an utterance to local MCP tools/call (never raw REST).
+
+    Simple keywords map 1:1. Compound natural language is orchestrated as a
+    chained MCP workflow that always stops on a dry-run preview for HITL.
+    """
     get_kill_switch().raise_if_tripped()
     text = user_input.strip()
     if not text:
@@ -600,6 +873,28 @@ async def process_intent(user_input: str) -> None:
     history_limit = parse_history_limit(text)
     if history_limit is not None:
         await tool_history(history_limit)
+        return
+
+    if looks_like_compound_workflow(text):
+        workflow = parse_workflow_intent(text)
+        if workflow is None:
+            with RUNTIME.console.status("[info]Planning multi-step MCP workflow…[/info]"):
+                workflow = await asyncio.to_thread(llm_plan_workflow, text)
+        if workflow is not None:
+            await tool_workflow(workflow)
+            return
+        render_warning(
+            "Unable to plan a safe Testnet workflow",
+            "The utterance looks multi-step, but SentinelOS could not build an "
+            "allowlisted MCP plan. No order was sent. Try: "
+            "[info]Check my spot balance, analyze ETHUSDT, and if the market looks "
+            "stable, prepare a spot order to buy using 5% of my available USDT.[/info]",
+        )
+        return
+
+    positions = parse_positions_intent(text)
+    if positions is not None:
+        await tool_positions(positions.symbol)
         return
 
     analyze = parse_analyze_symbol(text)
@@ -624,7 +919,8 @@ async def process_intent(user_input: str) -> None:
         "[warn]Intent not recognized.[/warn] Type [info]help[/info] for the tool list. "
         "Examples: [info]analyze BTCUSDT[/info], "
         "[info]buy BTCUSDT 0.001 --sl 58000 --tp 62000[/info], "
-        "[info]futures buy BTCUSDT 0.001[/info], [info]history[/info], [info]kill[/info]."
+        "[info]futures buy BTCUSDT 0.001[/info], "
+        "[info]positions[/info], [info]history[/info], [info]kill[/info]."
     )
 
 

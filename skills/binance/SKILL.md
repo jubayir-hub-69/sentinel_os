@@ -4,11 +4,13 @@ title: Binance Testnet (SentinelOS)
 description: |
   Routes all Binance Spot and USD-M Futures trading intents exclusively through
   SentinelOS local Testnet tools. Use when the user asks to check Testnet balances,
-  analyze a Testnet symbol, preview or submit a Spot/Futures Testnet trade with
-  optional SL/TP, inspect audit history, or trigger the kill-switch. Requires auth.
-  Production Binance APIs are forbidden.
+  list open Futures Testnet positions, analyze a Testnet symbol, orchestrate a
+  multi-step natural-language workflow (balance → analyze → percent size → preview),
+  preview or submit a Spot/Futures Testnet trade with optional SL/TP, inspect audit
+  history, or trigger the kill-switch. Requires auth. Production Binance APIs are
+  forbidden.
 metadata:
-  version: "1.3.0"
+  version: "1.4.0"
   author: SentinelOS
   environment: testnet
   venue: spot+futures
@@ -67,7 +69,9 @@ capabilities; never as a bypass around local Testnet guardrails.
 |-------------|------|
 | Show Spot Testnet balances / account | `get_spot_testnet_balance` |
 | Show Futures Testnet balances | `get_futures_testnet_balance` |
+| Show open Futures Testnet positions | `get_futures_testnet_positions` |
 | Technical / sentiment reading | `analyze_symbol` |
+| Multi-step NL (balance + analyze + % size) | chained tools below, then `preview_*` — **never** `submit_*` until `Y` |
 | Preview a Spot buy/sell (optional SL/TP) | `preview_spot_testnet_order` |
 | Place a Spot Testnet order after confirm | `submit_spot_testnet_order` (`human_confirmed=true`) |
 | Preview a Futures buy/sell (optional SL/TP) | `preview_futures_testnet_order` |
@@ -117,6 +121,7 @@ process raises `RuntimeError`. Submit tools default `human_confirmed=false`
 |----------|---------------|----------|
 | `get_spot_testnet_balance` | No | Signed Spot Testnet account. |
 | `get_futures_testnet_balance` | No | Signed Futures Testnet account. |
+| `get_futures_testnet_positions` | No | Signed `GET /fapi/v2/positionRisk`. Open positions only (symbol, side, entry, uPnL, size). |
 | `analyze_symbol` | No | Live Testnet tickers + Google Gemini. Model is selected dynamically via `client.models.list()` (first flash model that supports `generateContent`). |
 | `preview_*_testnet_order` | No | Local dry-run. Returns `{"environment": "testnet", "status": "order_preview"}`. Enforces size limits. Does not call `new_order`. |
 | `submit_*_testnet_order` | Yes (Testnet only) | Requires `human_confirmed=true`. Enforces 10% / $1000 cap, then submits MARKET and optional SL/TP. |
@@ -130,15 +135,23 @@ process raises `RuntimeError`. Submit tools default `human_confirmed=false`
    if the local tools cannot answer a **read-only** discovery question. Do not execute trades
    through the **hosted** MCP. All Testnet trades use the local `sentinelos-testnet-mcp` server.
 4. For balance questions, `tools/call` the matching Testnet balance tool.
-5. For `analyze SYMBOL`, `tools/call analyze_symbol` and show the Testnet snapshot plus Gemini bullets. The model is resolved at runtime from the Gemini catalog.
-6. For any intended order:
+5. For open Futures positions, `tools/call get_futures_testnet_positions`. Read-only.
+6. For `analyze SYMBOL`, `tools/call analyze_symbol` and show the Testnet snapshot plus Gemini bullets. The model is resolved at runtime from the Gemini catalog.
+7. For **compound natural language** (example: *Check my spot balance, analyze ETHUSDT, and if the market looks stable, prepare a spot order to buy using 5% of my available USDT.*):
+   1. `tools/call get_spot_testnet_balance`.
+   2. `tools/call analyze_symbol` with the named symbol.
+   3. Compute quantity locally: `qty = (percent / 100) * available_USDT / last_price`. Cap at min(10% of equity, 1000 USDT).
+   4. If the user gated on a stable market and the Testnet snapshot is not stable, **stop**. Do not preview.
+   5. `tools/call preview_spot_testnet_order` (or the Futures preview). **STOP.**
+   6. Ask the human to type `Y`. Do **not** call `submit_*` in the same chain. `human_confirmed` stays false until that `Y`.
+8. For any intended order:
    1. `tools/call` the matching `preview_*_testnet_order` (include `--sl` / `--tp` when provided).
    2. Show venue, symbol, side, type (`MARKET`), quantity, SL/TP, estimated notional, and the 10% / $1000 rule.
    3. Ask the user to type `Y` to confirm.
    4. Treat missing, implied, ambiguous, or timed-out replies as denial.
    5. Only then `tools/call` `submit_*_testnet_order` with `human_confirmed=true`.
-7. If `PermissionError` or `RuntimeError` is raised, stop. Do not retry against another host.
-8. If the user types `kill`, `tools/call trip_kill_switch` and shut down.
+9. If `PermissionError` or `RuntimeError` is raised, stop. Do not retry against another host.
+10. If the user types `kill`, `tools/call trip_kill_switch` and shut down.
 
 ## Security
 

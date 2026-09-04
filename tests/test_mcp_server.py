@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 REQUIRED_TOOLS = {
     "get_spot_testnet_balance",
     "get_futures_testnet_balance",
+    "get_futures_testnet_positions",
     "preview_spot_testnet_order",
     "submit_spot_testnet_order",
     "preview_futures_testnet_order",
@@ -48,6 +49,11 @@ async def test_mcp_lists_trade_tools() -> None:
         props = schema.get("properties") or {}
         assert "human_confirmed" in props
         assert "symbol" in props
+        positions = next(tool for tool in listed.tools if tool.name == "get_futures_testnet_positions")
+        annotations = getattr(positions, "annotations", None)
+        if annotations is not None:
+            assert getattr(annotations, "read_only_hint", True) is True
+            assert getattr(annotations, "destructive_hint", False) is False
 
     await _with_client(inner)
 
@@ -104,6 +110,7 @@ async def test_mcp_prompt_forbids_unsigned_confirm() -> None:
         listed = await client.list_prompts()
         names = {prompt.name for prompt in listed.prompts}
         assert "confirm_testnet_order" in names
+        assert "orchestrate_testnet_workflow" in names
         rendered = await client.get_prompt(
             "confirm_testnet_order",
             {"venue": "futures", "symbol": "BTCUSDT", "side": "BUY", "quantity": "0.005"},
@@ -113,6 +120,22 @@ async def test_mcp_prompt_forbids_unsigned_confirm() -> None:
         )
         assert "Y" in text
         assert "human_confirmed" in text
+        workflow = await client.get_prompt(
+            "orchestrate_testnet_workflow",
+            {
+                "utterance": (
+                    "Check my spot balance, analyze ETHUSDT, and if the market looks "
+                    "stable, prepare a spot order to buy using 5% of my available USDT."
+                )
+            },
+        )
+        workflow_text = " ".join(
+            getattr(message.content, "text", str(message.content)) for message in workflow.messages
+        )
+        assert "get_spot_testnet_balance" in workflow_text
+        assert "preview_spot_testnet_order" in workflow_text
+        assert "submit" in workflow_text.lower()
+        assert "Y" in workflow_text
 
     await _with_client(inner)
 
@@ -130,6 +153,16 @@ def test_agent_does_not_import_rest_wrappers() -> None:
         assert needle not in source, f"agent.py still imports REST wrapper: {needle}"
     assert "from core.mcp_host import" in source
     assert "host.call(" in source
+    assert "preview_spot_testnet_order" in source
+    assert "_WORKFLOW_FORBIDDEN_TOOLS" in source
+    assert "submit_spot_testnet_order" in source
+    assert "get_futures_testnet_positions" in source
+    # The orchestrator must not call submit tools except via tool_trade after HITL.
+    workflow_fn = source.split("async def tool_workflow", 1)[1].split("async def _workflow_quantity", 1)[0]
+    assert "human_confirmed" not in workflow_fn
+    assert "submit_spot_testnet_order" not in workflow_fn
+    assert "submit_futures_testnet_order" not in workflow_fn
+    assert "await tool_trade(" in workflow_fn
 
 
 if __name__ == "__main__":

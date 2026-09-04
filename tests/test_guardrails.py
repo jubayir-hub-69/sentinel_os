@@ -10,7 +10,14 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.cli_parse import parse_analyze_symbol, parse_history_limit, parse_trade_intent
+from core.cli_parse import (
+    looks_like_compound_workflow,
+    parse_analyze_symbol,
+    parse_history_limit,
+    parse_positions_intent,
+    parse_trade_intent,
+    parse_workflow_intent,
+)
 from core.risk import (
     MAX_EXPOSURE_FRACTION,
     MAX_NOTIONAL_USDT,
@@ -47,6 +54,46 @@ def test_parse_analyze_and_history() -> None:
     assert parse_analyze_symbol("analyze BTCUSDT") == "BTCUSDT"
     assert parse_history_limit("history") == 40
     assert parse_history_limit("history 12") == 12
+
+
+def test_parse_positions_intent() -> None:
+    all_open = parse_positions_intent("positions")
+    assert all_open is not None
+    assert all_open.symbol is None
+    filtered = parse_positions_intent("futures positions ETHUSDT")
+    assert filtered is not None
+    assert filtered.symbol == "ETHUSDT"
+    assert parse_positions_intent("open positions") is not None
+    assert parse_positions_intent("balance") is None
+
+
+def test_parse_compound_workflow_example() -> None:
+    utterance = (
+        "Check my spot balance, analyze ETHUSDT, and if the market looks stable, "
+        "prepare a spot order to buy using 5% of my available USDT."
+    )
+    assert looks_like_compound_workflow(utterance) is True
+    assert parse_trade_intent(utterance) is None
+    intent = parse_workflow_intent(utterance)
+    assert intent is not None
+    assert intent.check_spot_balance is True
+    assert intent.check_futures_balance is False
+    assert intent.analyze_symbol == "ETHUSDT"
+    assert intent.require_stable is True
+    assert intent.trade_venue == "spot"
+    assert intent.trade_side == "BUY"
+    assert intent.trade_symbol == "ETHUSDT"
+    assert intent.percent_of_available == "5"
+    assert intent.percent_asset == "USDT"
+
+
+def test_simple_commands_are_not_compound() -> None:
+    assert looks_like_compound_workflow("balance") is False
+    assert looks_like_compound_workflow("futures balance") is False
+    assert looks_like_compound_workflow("analyze ETHUSDT") is False
+    assert looks_like_compound_workflow("buy ETHUSDT 0.01") is False
+    assert looks_like_compound_workflow("positions") is False
+    assert looks_like_compound_workflow("help") is False
 
 
 def test_size_limit_hard_cap() -> None:
@@ -207,6 +254,117 @@ def test_futures_sl_tp_retries_without_reduce_only() -> None:
     assert all(path == "/fapi/v1/algoOrder" for _, path, _ in client.calls)
 
 
+def test_quantity_from_percent_respects_hard_cap() -> None:
+    from core.planner import format_quantity, quantity_from_percent, workflow_intent_from_plan
+
+    sized = quantity_from_percent(
+        available_usdt=Decimal("50000"),
+        percent=Decimal("5"),
+        last_price=Decimal("2500"),
+    )
+    # 5% of 50_000 = 2500, but the 1000 USDT hard cap applies.
+    assert sized["notional_usdt"] == Decimal("1000")
+    assert sized["capped"] is True
+    assert sized["quantity"] == Decimal("0.4")
+    assert format_quantity(sized["quantity"]) == "0.4"  # type: ignore[arg-type]
+
+    within = quantity_from_percent(
+        available_usdt=Decimal("2000"),
+        percent=Decimal("5"),
+        last_price=Decimal("2000"),
+    )
+    assert within["notional_usdt"] == Decimal("100")
+    assert within["capped"] is False
+
+    plan = workflow_intent_from_plan(
+        {
+            "check_spot_balance": True,
+            "analyze_symbol": "ETHUSDT",
+            "trade_side": "BUY",
+            "trade_venue": "spot",
+            "trade_symbol": "ETHUSDT",
+            "percent_of_available": "5",
+            "submit": True,
+            "human_confirmed": True,
+        }
+    )
+    assert plan is not None
+    assert plan.check_spot_balance is True
+    assert plan.trade_side == "BUY"
+    assert plan.percent_of_available == "5"
+    assert not hasattr(plan, "human_confirmed")
+    assert not hasattr(plan, "submit")
+
+
+def test_stability_gate_fail_closed() -> None:
+    from core.planner import assess_market_stability
+
+    stable, _reason = assess_market_stability(
+        {
+            "analysis": "Range-bound and stable on Testnet.",
+            "market": {
+                "spot": {"price_change_percent": "1.2", "last_price": "3500"},
+                "futures": {"price_change_percent": "-0.4", "last_price": "3501"},
+            },
+        }
+    )
+    assert stable is True
+    volatile, reason = assess_market_stability(
+        {
+            "analysis": "High volatility spike.",
+            "market": {"spot": {"price_change_percent": "12.0", "last_price": "3500"}},
+        }
+    )
+    assert volatile is False
+    assert "fail-closed" in reason.lower() or "stability" in reason.lower()
+    unknown, _ = assess_market_stability({"analysis": "", "market": {}})
+    assert unknown is False
+
+
+def test_open_positions_from_rows_filters_zero() -> None:
+    from tools.binance_futures_testnet_tools import _open_positions_from_rows
+
+    rows = [
+        {
+            "symbol": "ETHUSDT",
+            "positionAmt": "0.25",
+            "positionSide": "LONG",
+            "entryPrice": "3500.1",
+            "unRealizedProfit": "12.5",
+            "markPrice": "3550",
+            "notional": "887.5",
+            "leverage": "5",
+        },
+        {
+            "symbol": "BTCUSDT",
+            "positionAmt": "0.000",
+            "positionSide": "BOTH",
+            "entryPrice": "0",
+            "unRealizedProfit": "0",
+        },
+        {
+            "symbol": "SOLUSDT",
+            "positionAmt": "-2.0",
+            "positionSide": "BOTH",
+            "entryPrice": "140",
+            "unrealizedProfit": "-4.2",
+        },
+    ]
+    opened = _open_positions_from_rows(rows)
+    assert [row["symbol"] for row in opened] == ["ETHUSDT", "SOLUSDT"]
+    eth = opened[0]
+    assert eth["position_side"] == "LONG"
+    assert eth["entry_price"] == "3500.1"
+    assert eth["unrealized_pnl"] == "12.5"
+    assert eth["position_size"] == "0.25"
+    sol = opened[1]
+    assert sol["direction"] == "SHORT"
+    assert sol["position_side"] == "BOTH"
+    only_eth = _open_positions_from_rows(rows, "ETHUSDT")
+    assert len(only_eth) == 1
+    assert only_eth[0]["symbol"] == "ETHUSDT"
+
+
 def test_futures_tp_still_placed_if_sl_is_rejected() -> None:
     from decimal import Decimal
 
@@ -279,6 +437,12 @@ if __name__ == "__main__":
         test_parse_futures_flags_reversed,
         test_parse_rejects_trailing_junk,
         test_parse_analyze_and_history,
+        test_parse_positions_intent,
+        test_parse_compound_workflow_example,
+        test_simple_commands_are_not_compound,
+        test_quantity_from_percent_respects_hard_cap,
+        test_stability_gate_fail_closed,
+        test_open_positions_from_rows_filters_zero,
         test_size_limit_hard_cap,
         test_size_limit_ten_percent,
         test_size_limit_allows_within_cap,
