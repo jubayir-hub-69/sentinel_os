@@ -35,7 +35,11 @@ def validate_protective_prices(
     stop_loss: Decimal | None,
     take_profit: Decimal | None,
 ) -> None:
-    """Reject SL/TP levels that would trigger immediately or contradict the side."""
+    """Reject SL/TP levels that would trigger immediately or contradict the side.
+
+    BUY: stop-loss strictly below last price, take-profit strictly above.
+    SELL: stop-loss strictly above last price, take-profit strictly below.
+    """
     if last_price <= 0:
         raise ValueError("Last price must be greater than zero to validate SL/TP.")
     if stop_loss is not None and stop_loss <= 0:
@@ -67,7 +71,7 @@ def validate_protective_prices(
             f"SELL stop-loss {format(stop_loss, 'f')} must be strictly above "
             f"last price {format(last_price, 'f')}."
         )
-    if take_profit is not None and take_profit <= last_price:
+    if take_profit is not None and take_profit >= last_price:
         raise ValueError(
             f"SELL take-profit {format(take_profit, 'f')} must be strictly below "
             f"last price {format(last_price, 'f')}."

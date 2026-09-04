@@ -153,6 +153,77 @@ def test_sl_tp_buy_rules() -> None:
         pass
 
 
+def test_sell_take_profit_below_last_price_is_valid() -> None:
+    """A short take-profit below last price must be accepted, not rejected."""
+    validate_protective_prices(
+        side="SELL",
+        last_price=Decimal("3000"),
+        stop_loss=None,
+        take_profit=Decimal("2800"),
+    )
+
+
+def test_sell_stop_loss_above_last_price_is_valid() -> None:
+    validate_protective_prices(
+        side="SELL",
+        last_price=Decimal("3000"),
+        stop_loss=Decimal("3500"),
+        take_profit=None,
+    )
+
+
+def test_sl_tp_sell_rules() -> None:
+    validate_protective_prices(
+        side="SELL",
+        last_price=Decimal("3000"),
+        stop_loss=Decimal("3500"),
+        take_profit=Decimal("2800"),
+    )
+    try:
+        validate_protective_prices(
+            side="SELL",
+            last_price=Decimal("3000"),
+            stop_loss=None,
+            take_profit=Decimal("3200"),
+        )
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "strictly below" in str(exc)
+    try:
+        validate_protective_prices(
+            side="SELL",
+            last_price=Decimal("3000"),
+            stop_loss=Decimal("2800"),
+            take_profit=None,
+        )
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "strictly above" in str(exc)
+
+
+def test_sell_protective_prices_equal_to_last_price_are_rejected() -> None:
+    try:
+        validate_protective_prices(
+            side="SELL",
+            last_price=Decimal("3000"),
+            stop_loss=None,
+            take_profit=Decimal("3000"),
+        )
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "strictly below" in str(exc)
+    try:
+        validate_protective_prices(
+            side="SELL",
+            last_price=Decimal("3000"),
+            stop_loss=Decimal("3000"),
+            take_profit=None,
+        )
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "strictly above" in str(exc)
+
+
 def test_select_flash_models_from_catalog() -> None:
     from types import SimpleNamespace
 
@@ -447,6 +518,10 @@ if __name__ == "__main__":
         test_size_limit_ten_percent,
         test_size_limit_allows_within_cap,
         test_sl_tp_buy_rules,
+        test_sell_take_profit_below_last_price_is_valid,
+        test_sell_stop_loss_above_last_price_is_valid,
+        test_sl_tp_sell_rules,
+        test_sell_protective_prices_equal_to_last_price_are_rejected,
         test_select_flash_models_from_catalog,
         test_futures_sl_tp_uses_algo_order_endpoint,
         test_futures_sl_tp_retries_without_reduce_only,
