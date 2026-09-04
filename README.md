@@ -1,10 +1,10 @@
 # SentinelOS
 
-### Fail-Closed Risk-Defense Agent for Binance Agent OS (Track A)
+### Fail-Closed Risk-Defense Agent for Binance Agent OS — Track A
 
-**SentinelOS is built on Binance Agent OS & MCP (Model Context Protocol) architecture.** It is a conversational Testnet trading agent that observes Spot and USDⓈ-M Futures state, reasons over live market data with Google Gemini, and **refuses to execute anything irreversible unless a human types `Y`**. Production Binance hosts are unreachable by design.
+**SentinelOS is built on Binance Agent OS & MCP (Model Context Protocol).** It is a conversational Testnet trading agent that observes Spot and USDⓈ-M Futures state, reasons over live market data with Google Gemini, and **refuses to execute anything irreversible unless a human types `Y`**. Production Binance hosts are unreachable by design.
 
-> Track A alignment: **Security · Human-in-the-Loop · Fail-Closed guardrails.** Testnet-only. 10% portfolio cap and $1,000 notional ceiling. Emergency kill-switch. Append-only audit trail. No production API path exists in this repository.
+> Official Track A: **Build an AI agent with Agent OS.** SentinelOS ships two of the published Agent Workflows — **Data & Analysis** and **Trading Workflows** — behind a local MCP server, fail-closed Testnet pinning, a $1,000 / 10% notional ceiling, and mandatory human confirmation. This is **not** Track B (connect an agent to hosted Binance MCP and trade). Hosted MCP is discovery-only.
 
 [![Track A](https://img.shields.io/badge/Binance_Agent_OS-Track_A-F0B90B?style=for-the-badge)](https://developers.binance.com/en/docs/agent-native/overview)
 [![MCP](https://img.shields.io/badge/MCP-Model_Context_Protocol-191B1F?style=for-the-badge)](https://agent.binance.com/mcp/agentic)
@@ -14,27 +14,44 @@
 
 ---
 
-## Why this is a Track A Agent OS submission
+## Track A at a glance
 
-**Track A: Build an AI agent with Agent OS.** SentinelOS is not a script that fires orders. It is an Agent OS–native CLI whose policy layer sits **in front of** Binance.
+Official announcement: [Binance Agent OS Mini Hackathon](https://x.com/binance/status/2094810011557838988) · Agent Native docs: [MCP Overview](https://developers.binance.com/en/docs/agent-native/overview)
 
-| Official surface | How SentinelOS uses it |
+| Official Track A surface | SentinelOS implementation |
 | --- | --- |
-| [Agent Native / MCP Overview](https://developers.binance.com/en/docs/agent-native/overview) | Architecture, discovery, and tool-routing model |
+| **Build an AI agent with Agent OS** | CLI MCP host (`agent.py`) + local MCP server (`mcp_server.py`) + skill (`skills/binance/SKILL.md`) |
+| **Data & Analysis** — reports, market analysis, portfolio insights | `analyze_symbol` (live Testnet tickers + Gemini flash) · Spot/Futures balances · open Futures positions + uPnL |
+| **Trading Workflows** — signals, strategies, gated actions | Compound NL plan → MCP chain → dry-run preview → **exact `Y`** → Testnet MARKET + SL/TP |
+| Agent Native / [MCP Overview](https://developers.binance.com/en/docs/agent-native/overview) | Architecture, discovery, and tool-routing model |
 | [llms.txt](https://developers.binance.com/en/docs/llms.txt) / [llms-full.txt](https://developers.binance.com/en/docs/llms-full.txt) | Machine-readable API context for agent reasoning |
 | [Official MCP endpoint](https://agent.binance.com/mcp/agentic) | Capability **discovery only** — never a bypass around local guardrails |
-| Local MCP wrapper | [`mcp_server.py`](mcp_server.py) — official `mcp` SDK server for **all trade-related actions** |
+| Local MCP wrapper (required for trades) | [`mcp_server.py`](mcp_server.py) — official `mcp` SDK (`sentinelos-testnet-mcp`) for **all** trade-related actions |
 | [Binance Skills Hub](https://github.com/binance/binance-skills-hub) | Skill format — [`skills/binance/SKILL.md`](skills/binance/SKILL.md) |
 | [`binance-connector`](https://binance-connector.readthedocs.io/en/stable/getting_started.html) | Official Python Spot client, pinned to Testnet |
 | HMAC USDⓈ-M REST | Futures Testnet client pinned to `https://testnet.binancefuture.com` |
 
-Every utterance is routed locally: **intent → official MCP `tools/call` → Testnet tool**. The CLI is an MCP host (`mcp.Client`) talking to `mcp_server.py` (`sentinelos-testnet-mcp`). Standalone REST from the agent is forbidden. If the host, environment, size cap, kill-switch, or HITL check fails, the tool is never reached. Hosted MCP (`https://agent.binance.com/mcp/agentic`) is discovery-only.
+Every utterance is routed locally: **intent → official MCP `tools/call` → Testnet tool**. The CLI is an MCP host (`mcp.Client`) talking to `mcp_server.py`. Standalone REST from the agent is forbidden. If the host, environment, size cap, kill-switch, or HITL check fails, the submit tool is never reached.
+
+### Compliance scorecard
+
+| Control | Status | Enforcement |
+| --- | --- | --- |
+| True local MCP | **Pass** | Agent imports `core.mcp_host` only. `tools/list` + `tools/call`. No REST wrappers in `agent.py`. |
+| Testnet isolation | **Pass** | `BINANCE_ENV` must equal `testnet`. Hosts outside `{testnet.binance.vision, testnet.binancefuture.com}` raise `RuntimeError`. Every JSON payload is `"environment": "testnet"`. |
+| $1,000 / 10% cap | **Pass** | Hardcoded in [`core/risk.py`](core/risk.py). Notional, not leveraged margin. Breach → `PermissionError` + **SECURITY WARNING** even after `Y`. |
+| SELL SL / TP | **Pass** | BUY: SL below / TP above last Testnet price. SELL: SL above / TP below. Invalid levels rejected before HITL. |
+| Human-in-the-loop | **Pass** | `human_confirmed=False` is denial. Only an exact CLI `Y` sets `True`. `N`, Enter, `yes`, and anything else abort. |
+| Fail-closed | **Pass** | No production fallback. Kill-switch has no in-process resume. Missing credentials abort boot. |
+| Pinned dependencies | **Pass** | Exact pins in [`requirements.txt`](requirements.txt). Guardrail + MCP protocol tests: `python tests/test_guardrails.py` · `python tests/test_mcp_server.py`. |
 
 ---
 
 ## What judges should see in 60 seconds
 
 ```bash
+python tests/test_guardrails.py
+python tests/test_mcp_server.py
 python main.py
 ```
 
@@ -226,7 +243,14 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Dependencies: `binance-connector`, `pydantic>=2.0`, `pydantic-settings`, `python-dotenv`, `rich`, `aiohttp`, `httpx`, `google-genai`, `mcp[cli]>=2.0` (official Model Context Protocol SDK).
+Dependencies are pinned in [`requirements.txt`](requirements.txt): `binance-connector==3.13.0`, `pydantic==2.13.5`, `pydantic-settings==2.15.0`, `python-dotenv==1.2.3`, `rich==15.0.0`, `aiohttp==3.14.3`, `httpx==0.28.1`, `google-genai==2.22.0`, `mcp[cli]==2.1.1` (official Model Context Protocol SDK).
+
+Verify the guardrail and MCP protocol suites (no Testnet keys required):
+
+```bash
+python tests/test_guardrails.py
+python tests/test_mcp_server.py
+```
 
 The CLI talks to the local MCP server. External MCP hosts (Claude Desktop, Inspector) can attach over stdio:
 
