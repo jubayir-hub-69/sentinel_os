@@ -40,10 +40,12 @@ python main.py
 
 1. Startup banner states **Binance Agent OS & MCP**, then **Local MCP server ready** with `tools/list` names from `sentinelos-testnet-mcp`.
 2. `futures balance` is `tools/call get_futures_testnet_balance` (read-only USDⓈ-M Testnet wallet).
-3. `analyze BTCUSDT` fetches live Testnet tickers, then a Gemini reading from a **dynamically listed** flash model.
-4. `futures buy BTCUSDT 0.001 --sl 58000 --tp 62000` previews first. **Only `Y` submits.** `N` / Enter / anything else is denial.
-5. An oversized order prints **SECURITY WARNING** and is blocked even after `Y`.
-6. `history` prints `audit_log.txt`. `kill` closes clients and shuts down.
+3. `positions` is `tools/call get_futures_testnet_positions` (read-only open USDⓈ-M positions: size, side, entry, real-time uPnL).
+4. `analyze BTCUSDT` fetches live Testnet tickers, then a Gemini reading from a **dynamically listed** flash model.
+5. Compound NL such as `Check spot balance, analyze ETHUSDT, and prepare a spot order to buy using 5% of my available USDT` chains MCP tools (balance → analyze → local 5% math → preview) and **strictly stops** for HITL. It never auto-submits.
+6. `futures buy BTCUSDT 0.001 --sl 58000 --tp 62000` previews first. **Only `Y` submits.** `N` / Enter / anything else is denial.
+7. An oversized order prints **SECURITY WARNING** and is blocked even after `Y`.
+8. `history` prints `audit_log.txt`. `kill` closes clients and shuts down.
 
 ---
 
@@ -118,6 +120,38 @@ sentinel> kill
 ```
 
 Arms a process-wide latch, aborts pending tool work, closes Spot and Futures clients, writes `KILL_SWITCH` to the audit log, and shuts down. There is **no in-process resume**.
+
+### 7. True Agentic Multi-Step Workflow (Reasoning & Orchestration)
+
+The agent is not a one-shot keyword mapper. Compound natural language is planned and executed as a chained MCP workflow: observe → reason → size locally → dry-run preview → **stop**. Submit is never part of the plan.
+
+```text
+sentinel> Check spot balance, analyze ETHUSDT, and prepare a spot order to buy using 5% of my available USDT
+```
+
+Typical chain for that utterance:
+
+1. `tools/call get_spot_testnet_balance` (read-only).
+2. `tools/call analyze_symbol` for ETHUSDT (live Testnet tickers + Gemini).
+3. Local math: 5% of available USDT → quantity, still capped at **min(10% of equity, 1,000 USDT)**.
+4. `tools/call preview_spot_testnet_order` (dry-run, no fill).
+5. **STOP.** Human-in-the-loop `Y`/`N`. `submit_*` MCP tools are not called unless the operator types an exact `Y` against that preview.
+
+The orchestrator never auto-submits. `human_confirmed` stays `false` (denial) until that `Y`. `N`, Enter, or anything else aborts. A stability gate, missing quantity, over-limit size, or kill-switch aborts the chain before preview.
+
+### 8. Open Positions Checker
+
+Read-only USDⓈ-M Futures Testnet snapshot of currently open positions. No order is placed, cancelled, or modified.
+
+```text
+sentinel> positions
+sentinel> positions ETHUSDT
+```
+
+- MCP tool: `get_futures_testnet_positions` (`read_only_hint=True`).
+- Returns symbol, side, entry price, position size, unrealized PnL (uPnL), mark, and notional for every non-zero position.
+- Optional symbol filter. Zero-size rows are omitted.
+- Signed against `https://testnet.binancefuture.com` only. No production host is contacted. Funds are never at risk.
 
 ---
 
@@ -228,7 +262,9 @@ Equivalent: `python agent.py`. Type `help` at any time.
 | --- | --- | --- |
 | `balance` | Spot Testnet snapshot | No |
 | `futures balance` | USDⓈ-M Futures Testnet wallet | No |
+| `positions [SYMBOL]` | `get_futures_testnet_positions` — open USDⓈ-M positions, sizes, real-time uPnL | No |
 | `analyze SYMBOL` | Live Testnet tickers + Gemini flash reading | No |
+| `Check spot balance, analyze ETHUSDT, and prepare a spot order to buy using 5% of my available USDT` | Chained MCP tools (balance → analyze → local 5% math → preview) → **Y/N**. Submit is never auto-chained | Only after `Y` |
 | `buy SYMBOL QTY [--sl P] [--tp P]` | Preview → **Y/N** → Spot MARKET + SL/TP | Only after `Y` |
 | `sell SYMBOL QTY [--sl P] [--tp P]` | Preview → **Y/N** → Spot MARKET + SL/TP | Only after `Y` |
 | `futures buy SYMBOL QTY [--sl P] [--tp P]` | Preview → **Y/N** → Futures MARKET + SL/TP | Only after `Y` |
